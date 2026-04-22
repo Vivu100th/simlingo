@@ -50,7 +50,7 @@ class Llama(nn.Module):
 
         # Initializing a model from the llama-7b style configuration
         self.model = LlamaModel(configuration)
-        self.tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf") # Add huggingface token
+        self.tokenizer = AutoTokenizer.from_pretrained("NousResearch/Llama-2-7b-hf")  # Non-gated copy of Llama-2 tokenizer
         self.model.embed_tokens = None 
         # self.model.base_model.embed_tokens = None
         if self.tokenizer.pad_token is None:

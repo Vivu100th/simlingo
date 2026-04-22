@@ -1,7 +1,7 @@
 # @package _global_
 defaults:
   - /data_module: carla_bucket_v12
-  - /model/vision_model: llavanext
+  - /model/vision_model: resnet
 
 model:
   lr: 3e-5
@@ -16,10 +16,11 @@ model:
     downsample_feature_grid_factor: 2
 
 data_module:
-  data_path: database/simlingo
+  encoder: resnet
+  data_path: database/simlingo_v2_2026_04_21
   bucket_path: database/bucketsv2_simlingo
-  batch_size: 28
-  num_workers: 10
+  batch_size: 4
+  num_workers: 4
   route_as: target_point
   hist_len: 1
   cut_bottom_quarter: False
@@ -32,7 +33,7 @@ data_module:
 
 max_epochs: 30
 seed: 42
-gpus: 8
+gpus: 1
 val_every_n_epochs: 2
 name: simlingo_base_seed_42
 

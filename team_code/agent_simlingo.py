@@ -33,13 +33,14 @@ from scipy.optimize import fsolve
 from transformers import AutoConfig, AutoProcessor
 
 import scenario_logger
-import team_code.transfuser_utils as t_u
+import transfuser_utils as t_u
 from scenario_logger import ScenarioLogger
-from simlingo_training.utils.custom_types import DrivingInput, LanguageLabel
+from simlingo_base_training.utils.custom_types import DrivingInput
+from simlingo_training.utils.custom_types import LanguageLabel
 from simlingo_training.utils.internvl2_utils import build_transform, dynamic_preprocess
-from team_code.config_simlingo import GlobalConfig
-from team_code.nav_planner import LateralPIDController, RoutePlanner
-from team_code.simlingo_utils import (
+from config_simlingo import GlobalConfig
+from nav_planner import LateralPIDController, RoutePlanner
+from simlingo_utils import (
     get_camera_extrinsics,
     get_camera_intrinsics,
     get_rotation_matrix,
@@ -58,8 +59,8 @@ def get_entry_point():
     return 'LingoAgent'
 
 
-DEBUG = False # saves images during evaluation
-HD_VIZ = False
+DEBUG = True # saves images during evaluation
+HD_VIZ = True
 USE_UKF = True
 
 class LingoAgent(autonomous_agent.AutonomousAgent):
@@ -145,7 +146,8 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         self.route_planner_min_distance = 7.5
 
         #load config from .hydra folder
-        self.config_load_path = Path(self.config_path).parent.parent.parent / '.hydra' / 'config.yaml'
+        base_dir = self.config_path.split("/checkpoints/")[0]
+        self.config_load_path = Path(base_dir) / '.hydra' / 'config.yaml'
         with open(self.config_load_path, 'r') as file:
             cfg = OmegaConf.load(file)
         self.cfg = cfg
@@ -155,22 +157,25 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         if 'tokenizer' in processor.__dict__:
                 self.tokenizer = processor.tokenizer
         else:
-                self.tokenizer = processor
+                from transformers import AutoTokenizer
+                self.tokenizer = AutoTokenizer.from_pretrained("NousResearch/Llama-2-7b-hf")
         self.tokenizer.add_special_tokens({'additional_special_tokens': ['<WAYPOINTS>','<WAYPOINTS_DIFF>', '<ORG_WAYPOINTS_DIFF>', '<ORG_WAYPOINTS>', '<WAYPOINT_LAST>', '<ROUTE>', '<ROUTE_DIFF>', '<TARGET_POINT>']})
         self.tokenizer.padding_side = "left"
         # llm_tokenizer = AutoTokenizer.from_pretrained(cfg.model.language_model.variant)
         cache_dir = f"pretrained/{(cfg.model.vision_model.variant.split('/')[1])}"
+        self.model_dtype = torch.float16 if 'resnet' in self.cfg.model.vision_model.variant.lower() else torch.bfloat16
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(torch.bfloat16)
+        torch.set_default_dtype(self.model_dtype)
         self.model = hydra.utils.instantiate(
                 cfg.model,
-                cfg_data_module=cfg.data_module,
-                processor=processor,
-                cache_dir=cache_dir,
-                _recursive_=False
+                route_as=cfg.data_module.route_as, 
+                vision_model={
+                    "use_global_img": cfg.data_module.use_global_img,
+                }
             ).to(self.device)
         torch.set_default_dtype(default_dtype)
         self.model.load_state_dict(torch.load(self.config_path))
+        self.model = self.model.to(dtype=self.model_dtype)
         self.iter = self.config_path.split("epoch=")[-1].split("/")[0]
         self.session = self.config_path.split("/")[-4]
         
@@ -209,7 +214,7 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         self.state_log = deque(maxlen=max((self.lidar_seq_len * self.data_save_freq), 2))
 
         # Path to where visualizations and other debug output gets stored
-        self.save_path = os.environ.get('SAVE_PATH') + self.save_path_root
+        self.save_path = os.environ.get('SAVE_PATH', 'eval_outputs/') + '/' + self.save_path_root
         # self.checkpoint_path = os.environ.get('CHECKPOINT_ENDPOINT').
 
         # Logger that generates logs used for infraction replay in the results_parser.
@@ -316,11 +321,11 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         if HD_VIZ:
             sensors += [{
                                                 'type': 'sensor.camera.rgb',
-                                                'x': -5.5, 'y': 0.0, 'z':3.5,
+                                                'x': -2.0, 'y': 0.0, 'z': 2.0,
                                                 'roll': 0.0, 'pitch': -15.0, 'yaw': 0.0,
                                                 # 'width': 960, 'height': 540, 'fov': 110,
                                                 # 'width': 1280, 'height': 720, 'fov': 120,
-                                                'width': 1920, 'height': 1080, 'fov': 110,
+                                                'width': 800, 'height': 600, 'fov': 110,
                                                 'id': 'rgb_viz'
             }]
 
@@ -407,6 +412,10 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
             new_width = processed_image.shape[4]
             processed_image = processed_image.view(1, self.T, num_patches, C, new_height, new_width)
             
+        elif 'resnet' in self.cfg.model.vision_model.variant.lower():
+            num_patches = rgbs.shape[0]
+            C_val, H_val, W_val = rgbs.shape[1:]
+            processed_image = torch.tensor(rgbs).view(1, self.T, num_patches, C_val, H_val, W_val)
         else:
             raise NotImplementedError(f"Encoder {self.cfg.data_module.encoder} not implemented yet")
         
@@ -583,85 +592,90 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
                         questions.append(conv[i]['content'][0]['text'])
                         conv[i]['content'] = conv[i]['content'][0]['text']
                         
-        cache_dir = f"pretrained/{(self.cfg.model.vision_model.variant.split('/')[1])}"
-        # get absolute path from workspace dir not wokring dir
-        cache_dir = to_absolute_path(cache_dir)
-        model_path = f"{cache_dir}/conversation.py"
-        if not os.path.exists(model_path):
-                from huggingface_hub import snapshot_download
-                snapshot_download(repo_id=self.cfg.model.vision_model.variant, local_dir=cache_dir)
-                
-        #import from file from model_path
-        spec = importlib.util.spec_from_file_location('get_conv_template', model_path)
-        conv_module = importlib.util.module_from_spec(spec)
-        sys.modules['get_conv_template'] = conv_module
-        spec.loader.exec_module(conv_module)
-        
-        if not hasattr(self, 'tmp_config'):
-                self.tmp_config = AutoConfig.from_pretrained(self.cfg.model.vision_model.variant, trust_remote_code=True)
-                image_size = self.tmp_config.force_image_size or self.tmp_config.vision_config.image_size
-                patch_size = self.tmp_config.vision_config.patch_size
-                
-                self.num_image_token = int((image_size // patch_size) ** 2 * (self.tmp_config.downsample_ratio ** 2))
-                
-        prompt_batch_list = []
-        for idx, conv in enumerate(conv_batch_list):
-                question = questions[idx]
-                if '<image>' not in question:
-                        question = '<image>\n' + question
-                template = conv_module.get_conv_template('internlm2-chat')
-                template_inference = None
-                
-                template_inference = conv_module.get_conv_template('internlm2-chat')
-                for conv_part_idx, conv_part in enumerate(conv):
-                        if conv_part['role'] == 'assistant':
-                                # template.append_message(template.roles[1], conv_part['content'])
-                                template.append_message(template.roles[1], None)
-                        elif conv_part['role'] == 'user':
-                                if conv_part_idx == 0 and '<image>' not in conv_part['content']:
-                                        # add image token
-                                        conv_part['content'] = '<image>\n' + conv_part['content']
-                                template.append_message(template.roles[0], conv_part['content'])
-                        else:
-                                raise ValueError(f"Role {conv_part['role']} not supported")
-                            
-                query = template.get_prompt()
-                # remove system prompt
-                system_prompt = template.system_template.replace('{system_message}', template.system_message) + template.sep
-                query = query.replace(system_prompt, '')
-                
-                IMG_START_TOKEN='<img>'
-                IMG_END_TOKEN='</img>'
-                IMG_CONTEXT_TOKEN='<IMG_CONTEXT>'
-                num_patches_all = 2 # sum(grid_nums)
+        if 'resnet' in self.cfg.model.vision_model.variant.lower():
+            ll = None
+        else:
+            cache_dir = f"pretrained/{(self.cfg.model.vision_model.variant.split('/')[1])}"
+            # get absolute path from workspace dir not wokring dir
+            cache_dir = to_absolute_path(cache_dir)
+            model_path = f"{cache_dir}/conversation.py"
+            if not os.path.exists(model_path):
+                    from huggingface_hub import snapshot_download
+                    snapshot_download(repo_id=self.cfg.model.vision_model.variant, local_dir=cache_dir)
+                    
+            #import from file from model_path
+            spec = importlib.util.spec_from_file_location('get_conv_template', model_path)
+            conv_module = importlib.util.module_from_spec(spec)
+            sys.modules['get_conv_template'] = conv_module
+            spec.loader.exec_module(conv_module)
+            
+            if not hasattr(self, 'tmp_config'):
+                    self.tmp_config = AutoConfig.from_pretrained(self.cfg.model.vision_model.variant, trust_remote_code=True)
+                    image_size = self.tmp_config.force_image_size or self.tmp_config.vision_config.image_size
+                    patch_size = self.tmp_config.vision_config.patch_size
+                    
+                    self.num_image_token = int((image_size // patch_size) ** 2 * (self.tmp_config.downsample_ratio ** 2))
+                    
+            prompt_batch_list = []
+            for idx, conv in enumerate(conv_batch_list):
+                    question = questions[idx]
+                    if '<image>' not in question:
+                            question = '<image>\n' + question
+                    template = conv_module.get_conv_template('internlm2-chat')
+                    template_inference = None
+                    
+                    template_inference = conv_module.get_conv_template('internlm2-chat')
+                    for conv_part_idx, conv_part in enumerate(conv):
+                            if conv_part['role'] == 'assistant':
+                                    # template.append_message(template.roles[1], conv_part['content'])
+                                    template.append_message(template.roles[1], None)
+                            elif conv_part['role'] == 'user':
+                                    if conv_part_idx == 0 and '<image>' not in conv_part['content']:
+                                            # add image token
+                                            conv_part['content'] = '<image>\n' + conv_part['content']
+                                    template.append_message(template.roles[0], conv_part['content'])
+                            else:
+                                    raise ValueError(f"Role {conv_part['role']} not supported")
+                                
+                    query = template.get_prompt()
+                    # remove system prompt
+                    system_prompt = template.system_template.replace('{system_message}', template.system_message) + template.sep
+                    query = query.replace(system_prompt, '')
+                    
+                    IMG_START_TOKEN='<img>'
+                    IMG_END_TOKEN='</img>'
+                    IMG_CONTEXT_TOKEN='<IMG_CONTEXT>'
+                    num_patches_all = 2 # sum(grid_nums)
+    
+                    image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * num_patches_all + IMG_END_TOKEN
+                    query = query.replace('<image>', image_tokens, 1)
+                    prompt_batch_list.append(query)
+                    
+            prompt_tokenized = self.tokenizer(prompt_batch_list, padding=True, return_tensors="pt", return_offsets_mapping=True, add_special_tokens=False)
+            prompt_tokenized_ids = prompt_tokenized["input_ids"]
+            prompt_tokenized_char_offsets = prompt_tokenized["offset_mapping"].view(1, -1, 2)
+            prompt_tokenized_valid = prompt_tokenized["input_ids"] != self.tokenizer.pad_token_id
+            prompt_tokenized_mask = prompt_tokenized_valid
+            
+            ll = LanguageLabel(
+                    phrase_ids=prompt_tokenized_ids.to(self.device),
+                    phrase_valid=prompt_tokenized_valid.to(self.device),
+                    phrase_mask=prompt_tokenized_mask.to(self.device),
+                    placeholder_values=placeholder_batch_list,
+                    language_string=prompt_batch_list,
+                    loss_masking=None,
+            )
 
-                image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * num_patches_all + IMG_END_TOKEN
-                query = query.replace('<image>', image_tokens, 1)
-                prompt_batch_list.append(query)
-                
-        prompt_tokenized = self.tokenizer(prompt_batch_list, padding=True, return_tensors="pt", return_offsets_mapping=True, add_special_tokens=False)
-        prompt_tokenized_ids = prompt_tokenized["input_ids"]
-        prompt_tokenized_char_offsets = prompt_tokenized["offset_mapping"].view(1, -1, 2)
-        prompt_tokenized_valid = prompt_tokenized["input_ids"] != self.tokenizer.pad_token_id
-        prompt_tokenized_mask = prompt_tokenized_valid
-        
-        ll = LanguageLabel(
-                phrase_ids=prompt_tokenized_ids.to(self.device),
-                phrase_valid=prompt_tokenized_valid.to(self.device),
-                phrase_mask=prompt_tokenized_mask.to(self.device),
-                placeholder_values=placeholder_batch_list,
-                language_string=prompt_batch_list,
-                loss_masking=None,
-        )
-
-        self.DrivingInput["camera_images"] = processed_image.to(self.device).bfloat16()
+        self.DrivingInput["camera_images"] = processed_image.to(dtype=self.model_dtype, device=self.device)
         self.DrivingInput["image_sizes"] = image_sizes
-        self.DrivingInput["camera_intrinsics"] = torch.repeat_interleave(get_camera_intrinsics(W, H, 110).unsqueeze(0), 1, dim=0).view(1, 3, 3).float().to(self.device),
-        self.DrivingInput["camera_extrinsics"] = torch.repeat_interleave(get_camera_extrinsics().unsqueeze(0), 1, dim=0).view(1, 4, 4).float().to(self.device),
-        self.DrivingInput["vehicle_speed"] = result['speed']
-        self.DrivingInput["target_point"] = result['target_point'].to(self.device)
-        self.DrivingInput["prompt"] = ll
-        self.DrivingInput["prompt_inference"] = ll
+        self.DrivingInput["camera_intrinsics"] = torch.repeat_interleave(get_camera_intrinsics(W, H, 110).unsqueeze(0), 1, dim=0).view(1, 3, 3).float().to(self.device)
+        self.DrivingInput["camera_extrinsics"] = torch.repeat_interleave(get_camera_extrinsics().unsqueeze(0), 1, dim=0).view(1, 4, 4).float().to(self.device)
+        self.DrivingInput["vehicle_speed"] = result['speed'].to(dtype=self.model_dtype)
+        self.DrivingInput["target_point"] = result['target_point'].to(device=self.device, dtype=self.model_dtype)
+        if self.cfg.data_module.route_as == 'target_point':
+            self.DrivingInput["map_route"] = result['target_point'].to(device=self.device, dtype=self.model_dtype).unsqueeze(1)
+        else:
+            self.DrivingInput["map_route"] = None
 
         return result
 
@@ -681,20 +695,21 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
 
         # initialize DrivingInput with dict self.DrivingInput
         model_input = DrivingInput(**self.DrivingInput)
-        pred_speed_wps, pred_route, language = self.model(model_input)
+        pred_speed_wps, pred_route = self.model(model_input)
+        language = None
         pred_speed_wps = pred_speed_wps.float() if pred_speed_wps is not None else None
         pred_route = pred_route.float() if pred_route is not None else None
 
         # prepare velocity input
         gt_velocity = tick_data['speed']
 
-        if DEBUG and self.step%5 == 0:
+        if DEBUG:
             tvec = None
             rvec = None
 
             if HD_VIZ:
                 self.camera_for_viz = self.hd_cam_for_viz
-                tvec = np.array([[0.0, 3.5, 5.5]], np.float32)
+                tvec = np.array([[0.0, 2.0, 2.0]], np.float32)
 
                 cam_rots = [0.0, -15.0, 0.0]
                 rot_matrix = get_rotation_matrix(-cam_rots[0], -cam_rots[1], cam_rots[2])
@@ -759,8 +774,10 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
                 for idx, line in enumerate(lines):
                         draw.text((10, y_start + y_dist*(idx)), line, font=font, fill=(255, 255, 255, 255))
 
-            # save
+            # save and display
             image.save(f"{self.save_path_img}/{self.step}.png")
+            cv2.imshow('SimLingo Agent Vision', cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR))
+            cv2.waitKey(1)
             
         steer, throttle, brake = self.control_pid(pred_route, gt_velocity, pred_speed_wps)
 
@@ -817,7 +834,7 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         brake = ((desired_speed < self.config.brake_speed) or ((speed / desired_speed) > self.config.brake_ratio))
 
         delta = np.clip(desired_speed - speed, 0.0, self.config.clip_delta)
-        throttle = self.speed_controller.step(delta)
+        throttle = self.speed_controller.step(float(delta))
         throttle = np.clip(throttle, 0.0, self.config.clip_throttle)
         throttle = throttle if not brake else 0.0
 

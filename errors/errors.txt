@@ -1,0 +1,119 @@
+(simlingo_rtx5070) vivu@khavippro:~/Desktop/simlingo$ python -u Bench2Drive/leaderboard/leaderboard/leaderboard_evaluator.py \
+--routes=leaderboard/data/bench2drive_split/bench2drive_00.xml \
+--repetitions=1 \
+--track=SENSORS \
+--checkpoint=eval_results.json \
+--timeout=600 \
+--agent=team_code/agent_simlingo.py \
+--agent-config=outputs/2026_04_21_01_54_07_simlingo_base_seed_42/checkpoints/last.ckpt/pytorch_model.pt/pytorch_model.bin \
+--traffic-manager-seed=1 \
+--port=2000 \
+--traffic-manager-port=8000
+/home/vivu/software/carla0915/CarlaUE4.sh -RenderOffScreen -nosound -carla-rpc-port=2000 -graphicsadapter=0 None
+4.26.2-0+++UE4+Release-4.26 522 0
+Disabling core dumps.
+load_world success , attempts=0
+traffic_manager init success, try_time=0
+/home/vivu/miniconda3/envs/simlingo_rtx5070/lib/python3.10/site-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+
+========= Preparing RouteScenario_1711 (repetition 0) =========
+> Loading the world
+> Setting up the agent
+path to conf file: outputs/2026_04_21_01_54_07_simlingo_base_seed_42/checkpoints/last.ckpt/pytorch_model.pt/pytorch_model.bin+RouteScenario_1711_rep0_Town12_ParkingCutIn_1_15_04_21_17_02_02
+Config path: outputs/2026_04_21_01_54_07_simlingo_base_seed_42/checkpoints/last.ckpt/pytorch_model.pt/pytorch_model.bin
+Save path root: RouteScenario_1711_rep0_Town12_ParkingCutIn_1_15_04_21_17_02_02
+Loading weights: 100%|█████████████████████| 216/216 [00:00<00:00, 15084.91it/s]
+ResNetModel LOAD REPORT from: microsoft/resnet-34
+Key                 | Status     |  | 
+--------------------+------------+--+-
+classifier.1.weight | UNEXPECTED |  | 
+classifier.1.bias   | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+/home/vivu/miniconda3/envs/simlingo_rtx5070/lib/python3.10/site-packages/pytorch_lightning/utilities/parsing.py:213: Attribute 'vision_model' is an instance of `nn.Module` and is already saved during checkpointing. It is recommended to ignore them using `self.save_hyperparameters(ignore=['vision_model'])`.
+/home/vivu/miniconda3/envs/simlingo_rtx5070/lib/python3.10/site-packages/pytorch_lightning/utilities/parsing.py:213: Attribute 'language_model' is an instance of `nn.Module` and is already saved during checkpointing. It is recommended to ignore them using `self.save_hyperparameters(ignore=['language_model'])`.
+> Running the route
+=== [Agent] -- Wallclock = 2026-04-21 17:02:39.364 -- System time = 0.000 -- Game time = 0.050 -- Ratio = 0.000x
+/home/vivu/Desktop/simlingo/team_code/agent_simlingo.py:287: RuntimeWarning: The iteration is not making good progress, as measured by the 
+ improvement from the last ten iterations.
+  solution = fsolve(equations, initial_guess)
+=== [Agent] -- Wallclock = 2026-04-21 17:02:39.462 -- System time = 0.098 -- Game time = 0.100 -- Ratio = 1.019x
+
+Stopping the route, the agent has crashed:
+
+Traceback (most recent call last):
+  File "/home/vivu/Desktop/simlingo/Bench2Drive/leaderboard/leaderboard/scenarios/scenario_manager.py", line 188, in _tick_scenario
+    ego_action = self._agent_wrapper()
+  File "/home/vivu/Desktop/simlingo/Bench2Drive/leaderboard/leaderboard/autoagents/agent_wrapper.py", line 147, in __call__
+    return self._agent()
+  File "/home/vivu/Desktop/simlingo/Bench2Drive/leaderboard/leaderboard/autoagents/autonomous_agent.py", line 119, in __call__
+    control = self.run_step(input_data, timestamp)
+  File "/home/vivu/miniconda3/envs/simlingo_rtx5070/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/vivu/Desktop/simlingo/team_code/agent_simlingo.py", line 693, in run_step
+    pred_speed_wps, pred_route, language = self.model(model_input)
+  File "/home/vivu/miniconda3/envs/simlingo_rtx5070/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/vivu/miniconda3/envs/simlingo_rtx5070/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/vivu/Desktop/simlingo/simlingo_base_training/models/driving.py", line 133, in forward
+    input_embeds, _ = self.get_fixed_input_embeds(driving_input)
+  File "/home/vivu/Desktop/simlingo/simlingo_base_training/models/driving.py", line 176, in get_fixed_input_embeds
+    map_route = driving_input.map_route
+AttributeError: 'DrivingInput' object has no attribute 'map_route'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/vivu/Desktop/simlingo/Bench2Drive/leaderboard/leaderboard/leaderboard_evaluator.py", line 418, in _load_and_run_scenario
+    self.manager.run_scenario()
+  File "/home/vivu/Desktop/simlingo/Bench2Drive/leaderboard/leaderboard/scenarios/scenario_manager.py", line 161, in run_scenario
+    self._tick_scenario()
+  File "/home/vivu/Desktop/simlingo/Bench2Drive/leaderboard/leaderboard/scenarios/scenario_manager.py", line 196, in _tick_scenario
+    raise AgentError(e)
+leaderboard.autoagents.agent_wrapper.AgentError: 'DrivingInput' object has no attribute 'map_route'
+
+> Stopping the route
+
+========= Results of RouteScenario_1711 (repetition 0) ------ FAILURE =========
+
+╒═══════════════════════╤═════════════════════╕
+│ Start Time            │ 2026-04-21 17:02:39 │
+├───────────────────────┼─────────────────────┤
+│ End Time              │ 2026-04-21 17:02:40 │
+├───────────────────────┼─────────────────────┤
+│ System Time           │ 1.0s                │
+├───────────────────────┼─────────────────────┤
+│ Game Time             │ 0.1s                │
+├───────────────────────┼─────────────────────┤
+│ Ratio (Game / System) │ 0.1                 │
+╘═══════════════════════╧═════════════════════╛
+
+╒═══════════════════════╤═════════╤═════════╕
+│ Criterion             │ Result  │ Value   │
+├───────────────────────┼─────────┼─────────┤
+│ RouteCompletionTest   │ FAILURE │ 0.0 %   │
+├───────────────────────┼─────────┼─────────┤
+│ OutsideRouteLanesTest │ SUCCESS │ 0 %     │
+├───────────────────────┼─────────┼─────────┤
+│ CollisionTest         │ SUCCESS │ 0 times │
+├───────────────────────┼─────────┼─────────┤
+│ RunningRedLightTest   │ SUCCESS │ 0 times │
+├───────────────────────┼─────────┼─────────┤
+│ RunningStopTest       │ SUCCESS │ 0 times │
+├───────────────────────┼─────────┼─────────┤
+│ MinSpeedTest          │ SUCCESS │ 100 %   │
+├───────────────────────┼─────────┼─────────┤
+│ InRouteTest           │ SUCCESS │         │
+├───────────────────────┼─────────┼─────────┤
+│ AgentBlockedTest      │ SUCCESS │         │
+├───────────────────────┼─────────┼─────────┤
+│ Timeout               │ SUCCESS │         │
+╘═══════════════════════╧═════════╧═════════╛
+
+> Registering the route statistics
+False
+cost time=38.619181871414185
+> Registering the global statistics

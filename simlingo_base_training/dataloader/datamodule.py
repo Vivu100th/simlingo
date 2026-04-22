@@ -62,7 +62,7 @@ class DataModule(LightningDataModule):
                     self.llm_tokenizer.pad_token = "[PAD]"
 
             else:
-                self.llm_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf", token = "ADD_YOUR_TOKEN")
+                self.llm_tokenizer = AutoTokenizer.from_pretrained("NousResearch/Llama-2-7b-hf")
                 self.llm_tokenizer.add_eos_token = True
                 self.llm_tokenizer.add_bos_token = True
                 if self.llm_tokenizer.pad_token is None:
@@ -96,8 +96,9 @@ class DataModule(LightningDataModule):
             self.train_dataset = torch.utils.data.ConcatDataset([datasets[bucket] for bucket in bucket_list])
             weights_train = [[sample_weights[i]] * datasets[bucket].__len__() for i, bucket in enumerate(bucket_list)]
             weights_train = list(itertools.chain.from_iterable(weights_train))
-            num_samples_all = [datasets[bucket].__len__() // sample_weights[i] for i, bucket in enumerate(bucket_list)]
-            num_samples = int(min(num_samples_all))
+            num_samples_all = [datasets[bucket].__len__() / sample_weights[i] for i, bucket in enumerate(bucket_list) if datasets[bucket].__len__() > 0]
+            num_samples = int(min(num_samples_all)) if num_samples_all else len(self.train_dataset)
+            num_samples = max(1, num_samples) # Ensure it's at least 1
             print(f"Num samples: {num_samples}")
             print(f"Num samples all: {datasets['all'].__len__()}")
             # num_samples = int(datasets[bucket_list[-1]].__len__()//sample_weights[-1])

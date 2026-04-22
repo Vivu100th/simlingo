@@ -50,7 +50,7 @@ class ResnetEncoderModel(nn.Module):
 
         BS, num_frames, num_cams, C, H, W = pixel_values.shape
 
-        pixel_values = pixel_values.squeeze().view(1, C, H, W)
+        pixel_values = pixel_values.view(BS * num_frames * num_cams, C, H, W)
 
 
         img_embeddings = self.image_encoder(pixel_values=pixel_values).last_hidden_state # torch.Size([4, 512, 12, 32])

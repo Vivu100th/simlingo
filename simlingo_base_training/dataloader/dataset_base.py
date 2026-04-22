@@ -80,27 +80,29 @@ class BaseDataset(Dataset):  # pylint: disable=locally-disabled, invalid-name
             if self.bucket_name == "all":
                 pass
             elif self.bucket_name == 'acceleration_negative_5':
-                bucket_run_ids = bucket_dict['acceleration_-5']# + bucket_dict['acceleration_-20'] + bucket_dict['acceleration_-40']
+                bucket_run_ids = bucket_dict.get('acceleration_-5', []) # + bucket_dict.get('acceleration_-20', []) + bucket_dict.get('acceleration_-40', [])
             elif self.bucket_name == "acceleration_negative_1":
-                bucket_run_ids = bucket_dict['acceleration_-1']
+                bucket_run_ids = bucket_dict.get('acceleration_-1', [])
             elif self.bucket_name == "acceleration_positive_1":
-                bucket_run_ids = bucket_dict['acceleration_5']
+                bucket_run_ids = bucket_dict.get('acceleration_5', [])
             elif self.bucket_name == "acceleration_positive_5":
-                bucket_run_ids = bucket_dict['acceleration_20']# + bucket_dict['acceleration_40'] + bucket_dict['acceleration_1000000']
+                bucket_run_ids = bucket_dict.get('acceleration_20', []) # + bucket_dict.get('acceleration_40', []) + bucket_dict.get('acceleration_1000000', [])
             elif self.bucket_name == "lateral_control_1":
-                bucket_run_ids = bucket_dict['lateral_control_1']
+                bucket_run_ids = bucket_dict.get('lateral_control_1', [])
             elif self.bucket_name == "lateral_control_1_2":
-                bucket_run_ids = bucket_dict['lateral_control_1'] + bucket_dict['lateral_control_2']
+                bucket_run_ids = bucket_dict.get('lateral_control_1', []) + bucket_dict.get('lateral_control_2', [])
             elif self.bucket_name == "lateral_control_high":
-                bucket_run_ids = bucket_dict['lateral_control_2'] + bucket_dict['lateral_control_5'] + bucket_dict['lateral_control_1000000']
+                bucket_run_ids = bucket_dict.get('lateral_control_2', []) + bucket_dict.get('lateral_control_5', []) + bucket_dict.get('lateral_control_1000000', [])
             elif self.bucket_name == "lateral_control_higher_5":
-                bucket_run_ids = bucket_dict['lateral_control_5'] + bucket_dict['lateral_control_1000000']
+                bucket_run_ids = bucket_dict.get('lateral_control_5', []) + bucket_dict.get('lateral_control_1000000', [])
             elif self.bucket_name == "recovery":
-                bucket_run_ids = bucket_dict['recovery_data_small'] + bucket_dict['recovery_data_large']
+                bucket_run_ids = bucket_dict.get('recovery_data_small', []) + bucket_dict.get('recovery_data_large', [])
             else:
                 if self.bucket_name not in bucket_dict:
-                    raise ValueError(f"Bucket name {self.bucket_name} not found.")
-                bucket_run_ids = bucket_dict[self.bucket_name]
+                    print(f"Warning: Bucket {self.bucket_name} not found in dataset. Using empty list.")
+                    bucket_run_ids = []
+                else:
+                    bucket_run_ids = bucket_dict.get(self.bucket_name, [])
 
             run_id_dict = {}
             if bucket_run_ids is not None:
