@@ -534,6 +534,12 @@ def main():
                         if attempt < MAX_RETRIES:
                             print(f"  Waiting 10s before retry...")
                             time.sleep(10)
+                            if AUTO_START_CARLA:
+                                print(f"  [Auto-Recovery] Restarting CARLA to clear potential crash/hang...")
+                                stop_carla_server()
+                                subprocess.run("killall -9 CarlaUE4-Linux-Shipping", shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                                time.sleep(2)
+                                start_carla_server()
 
                 if not success or not is_route_completed(ckpt_endpoint):
                     failed += 1
@@ -541,6 +547,13 @@ def main():
 
                 # Print progress summary
                 print(f"\n  Progress: ✓{completed} | ⏭{skipped} | ✗{failed} / {total_jobs} total")
+
+                if AUTO_START_CARLA:
+                    print(f"  [Routine Maintenance] Restarting CARLA to free memory and prevent crashes...")
+                    stop_carla_server()
+                    subprocess.run("killall -9 CarlaUE4-Linux-Shipping", shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                    time.sleep(5)
+                    start_carla_server()
 
     except KeyboardInterrupt:
         print("\n\nInterrupted by user (Ctrl+C).")
