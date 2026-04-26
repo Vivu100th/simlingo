@@ -43,8 +43,11 @@ CODE_ROOT = r"/home/vivu/Desktop/simlingo"
 CARLA_ROOT = "/home/vivu/software/carla0915"
 
 # Dataset naming
+# Default to a stable merged dataset so multiple collection days are easy to train together.
+# Set USE_DAILY_DATASET=True if you want to go back to one folder per day.
+USE_DAILY_DATASET = False
 DATE = datetime.today().strftime("%Y_%m_%d")
-DATASET_NAME = "simlingo_v2_" + DATE
+DATASET_NAME = "simlingo_v2_" + DATE if USE_DAILY_DATASET else "simlingo_v2_all"
 ROOT_FOLDER = r"database/"  # With ending slash
 DATA_SAVE_DIRECTORY = ROOT_FOLDER + DATASET_NAME
 
@@ -60,7 +63,7 @@ CARLA_TM_PORT = 8000
 MAX_RETRIES = 3
 
 # Auto-start CARLA settings
-AUTO_START_CARLA = True   # Set to False if you want to start CARLA manually
+AUTO_START_CARLA = False   # Set to False if you want to start CARLA manually
 CARLA_STARTUP_WAIT = 40   # Seconds to wait for CARLA to fully load
 
 # ============================================================================
@@ -277,7 +280,7 @@ def validate_dataset(data_root):
     # Estimate total size
     try:
         result = subprocess.run(
-            ["du", "-sb", data_path],
+            ["du", "-s", "-b", "-L", data_path],
             capture_output=True, text=True, timeout=30
         )
         if result.returncode == 0:

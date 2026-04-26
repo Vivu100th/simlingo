@@ -31,10 +31,11 @@ from agents.navigation.local_planner import LocalPlanner, RoadOption
 
 # from: https://medium.com/codex/rgb-to-color-names-in-python-the-robust-way-ec4a9d97a01f
 from scipy.spatial import KDTree
-from webcolors import (
-    CSS2_HEX_TO_NAMES,
-    hex_to_rgb,
-)
+try:
+    from webcolors import CSS2_HEX_TO_NAMES, hex_to_rgb
+except ImportError:
+    from webcolors._definitions import _CSS2_HEX_TO_NAMES as CSS2_HEX_TO_NAMES
+    from webcolors import hex_to_rgb
 def convert_rgb_to_names(rgb_tuple):
     
     # a dictionary of all the hex and their respective names in css3

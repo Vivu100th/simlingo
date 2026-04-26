@@ -17,7 +17,7 @@ model:
 
 data_module:
   encoder: resnet
-  data_path: database/simlingo_v2_2026_04_21
+  data_path: database/simlingo_v2_all
   bucket_path: database/bucketsv2_simlingo
   batch_size: 4
   num_workers: 4
