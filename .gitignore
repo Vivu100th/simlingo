@@ -1,5 +1,9 @@
 viz
 
+# Local markdown notes/docs. Keep only the original root README visible.
+*.md
+!/README.md
+
 # Local CARLA/SimLingo datasets and generated artifacts
 database/
 pretrained/
@@ -19,7 +23,6 @@ mtid/outputs/*
 !mtid/outputs/.gitignore
 mtid/experiments/*
 !mtid/experiments/.gitignore
-!mtid/experiments/README.md
 
 # Training/evaluation run internals
 wandb/
