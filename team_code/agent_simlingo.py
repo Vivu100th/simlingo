@@ -34,8 +34,9 @@ from transformers import AutoConfig, AutoProcessor
 
 import scenario_logger
 import transfuser_utils as t_u
+from agents.navigation.local_planner import RoadOption
 from scenario_logger import ScenarioLogger
-from simlingo_base_training.utils.custom_types import DrivingInput
+from simlingo_training.utils.custom_types import DrivingInput
 from simlingo_training.utils.custom_types import LanguageLabel
 from simlingo_training.utils.internvl2_utils import build_transform, dynamic_preprocess
 from config_simlingo import GlobalConfig
@@ -46,6 +47,11 @@ from simlingo_utils import (
     get_rotation_matrix,
     project_points,
 )
+
+try:
+    from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
+except ImportError:
+    CarlaDataProvider = None
 
 # Configure pytorch for maximum performance
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -59,8 +65,8 @@ def get_entry_point():
     return 'LingoAgent'
 
 
-DEBUG = True # saves images during evaluation
-HD_VIZ = True
+DEBUG = False # saves images during evaluation
+HD_VIZ = False
 USE_UKF = True
 
 class LingoAgent(autonomous_agent.AutonomousAgent):
@@ -68,6 +74,16 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         Main class that runs the agents with the run_step function
         """
 
+    @staticmethod
+    def _unpack_model_output(model_output):
+        if not isinstance(model_output, (tuple, list)):
+            raise TypeError(f"Expected tuple/list model output, got {type(model_output)!r}")
+        if len(model_output) < 2:
+            raise ValueError(f"Expected at least speed waypoints and route, got {len(model_output)} outputs")
+        language = model_output[2] if len(model_output) > 2 else None
+        return model_output[0], model_output[1], language
+
+    @torch.no_grad()
     def setup(self, path_to_conf_file, route_index=None):
         """Sets up the agent. route_index is for logging purposes"""
 
@@ -151,14 +167,13 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         with open(self.config_load_path, 'r') as file:
             cfg = OmegaConf.load(file)
         self.cfg = cfg
-        self.cfg.model.vision_model.use_global_img = cfg.data_module.use_global_img
+        self.cfg.model.vision_model.use_global_img = cfg.data_module.get("use_global_img", False)
     
         processor = AutoProcessor.from_pretrained(cfg.model.vision_model.variant, trust_remote_code=True)
         if 'tokenizer' in processor.__dict__:
                 self.tokenizer = processor.tokenizer
         else:
-                from transformers import AutoTokenizer
-                self.tokenizer = AutoTokenizer.from_pretrained("NousResearch/Llama-2-7b-hf")
+                self.tokenizer = processor
         self.tokenizer.add_special_tokens({'additional_special_tokens': ['<WAYPOINTS>','<WAYPOINTS_DIFF>', '<ORG_WAYPOINTS_DIFF>', '<ORG_WAYPOINTS>', '<WAYPOINT_LAST>', '<ROUTE>', '<ROUTE_DIFF>', '<TARGET_POINT>']})
         self.tokenizer.padding_side = "left"
         # llm_tokenizer = AutoTokenizer.from_pretrained(cfg.model.language_model.variant)
@@ -166,16 +181,106 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         self.model_dtype = torch.float16 if 'resnet' in self.cfg.model.vision_model.variant.lower() else torch.bfloat16
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(self.model_dtype)
+        self.route_as = cfg.data_module.get("route_as", cfg.data_module.get("base_dataset", {}).get("route_as", "target_point_command"))
+        use_global_img = cfg.data_module.get("use_global_img", cfg.data_module.get("base_dataset", {}).get("use_global_img", False))
+        route_as = self.route_as
+        
         self.model = hydra.utils.instantiate(
                 cfg.model,
-                route_as=cfg.data_module.route_as, 
-                vision_model={
-                    "use_global_img": cfg.data_module.use_global_img,
-                }
-            ).to(self.device)
+                cfg_data_module=cfg.data_module,
+                processor=processor,
+                cache_dir=cache_dir,
+                route_as=route_as, 
+                _recursive_=False
+            )
+        import gc; gc.collect(); torch.cuda.empty_cache()
+        self.model = self.model.to(self.device)
         torch.set_default_dtype(default_dtype)
-        self.model.load_state_dict(torch.load(self.config_path))
+        
+        state_dict = torch.load(self.config_path, map_location="cpu", weights_only=False)
+        if "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+        elif "model_state_dict" in state_dict:
+            state_dict = state_dict["model_state_dict"]
+            
+        self.model.load_state_dict(state_dict)
+        import gc; gc.collect(); torch.cuda.empty_cache()
         self.model = self.model.to(dtype=self.model_dtype)
+        self.model.eval()
+        self.model.predict_language = bool(int(os.environ.get("SIMLINGO_CARLA_PREDICT_LANGUAGE", "0")))
+        self.debug_control = bool(int(os.environ.get("SIMLINGO_CARLA_DEBUG_CONTROL", "0")))
+        self.debug_control_freq = max(1, int(os.environ.get("SIMLINGO_CARLA_DEBUG_CONTROL_FREQ", "20")))
+        self.debug_collision = bool(int(os.environ.get("SIMLINGO_CARLA_DEBUG_COLLISION", "0")))
+        self.debug_waypoint_hazard = bool(
+            int(os.environ.get("SIMLINGO_CARLA_DEBUG_WAYPOINT_HAZARD", "0"))
+        )
+        self.steer_source = os.environ.get("SIMLINGO_CARLA_STEER_SOURCE", "model").strip().lower()
+        if self.steer_source not in {"model", "planner"}:
+            print(f"Unknown SIMLINGO_CARLA_STEER_SOURCE={self.steer_source!r}; using model", flush=True)
+            self.steer_source = "model"
+        self.speed_scale = max(0.0, float(os.environ.get("SIMLINGO_CARLA_SPEED_SCALE", "1.0")))
+        self.min_desired_speed = max(0.0, float(os.environ.get("SIMLINGO_CARLA_MIN_DESIRED_SPEED", "0.0")))
+        self.max_desired_speed = max(0.0, float(os.environ.get("SIMLINGO_CARLA_MAX_DESIRED_SPEED", "0.0")))
+        self.parking_exit_route_fix = bool(int(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_ROUTE_FIX", "0")))
+        self.parking_exit_yield = bool(int(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_YIELD", "0")))
+        self.parking_exit_yield_steps = max(0, int(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_YIELD_STEPS", "420")))
+        self.parking_exit_yield_brake_steps = max(
+            0, int(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_YIELD_BRAKE_STEPS", "160"))
+        )
+        self.parking_exit_yield_longitudinal = max(
+            0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_YIELD_LONGITUDINAL", "18.0"))
+        )
+        self.parking_exit_yield_lateral_min = max(
+            0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_YIELD_LATERAL_MIN", "0.5"))
+        )
+        self.parking_exit_yield_lateral_max = max(
+            self.parking_exit_yield_lateral_min,
+            float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_YIELD_LATERAL_MAX", "5.0")),
+        )
+        self.parking_exit_yield_distance = max(
+            0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_YIELD_DISTANCE", "25.0"))
+        )
+        self.parking_exit_creep_throttle = max(
+            0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_CREEP_THROTTLE", "0.25"))
+        )
+        self.parking_exit_merge_steer = min(
+            1.0,
+            max(0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_MERGE_STEER", "0.8"))),
+        )
+        self.parking_exit_nudge_static = bool(
+            int(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_NUDGE_STATIC", "0"))
+        )
+        self.parking_exit_nudge_static_speed = max(
+            0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_NUDGE_STATIC_SPEED", "0.2"))
+        )
+        self.parking_exit_nudge_static_distance = max(
+            0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_NUDGE_STATIC_DISTANCE", "7.0"))
+        )
+        self.parking_exit_nudge_static_lateral = max(
+            0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_NUDGE_STATIC_LATERAL", "1.2"))
+        )
+        self._parking_exit_route_fix_active = False
+        self._parking_exit_merge_side = 0
+        self._last_parking_exit_yield_debug = "off"
+        self._debug_collision_sensor = None
+        self._debug_collision_events = []
+        self._last_collision_debug = None
+        self._vehicle = None
+        self._world = None
+        self.world_map = None
+        print(
+            f"CARLA predict_language={self.model.predict_language} "
+            f"steer_source={self.steer_source} "
+            f"speed_scale={self.speed_scale:.3f} "
+            f"min_desired_speed={self.min_desired_speed:.3f} "
+            f"max_desired_speed={self.max_desired_speed:.3f} "
+            f"parking_exit_route_fix={int(self.parking_exit_route_fix)} "
+            f"parking_exit_yield={int(self.parking_exit_yield)} "
+            f"parking_exit_merge_steer={self.parking_exit_merge_steer:.3f} "
+            f"parking_exit_nudge_static={int(self.parking_exit_nudge_static)} "
+            f"debug_waypoint_hazard={int(self.debug_waypoint_hazard)}",
+            flush=True,
+        )
         self.iter = self.config_path.split("epoch=")[-1].split("/")[0]
         self.session = self.config_path.split("/")[-4]
         
@@ -292,11 +397,460 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         except Exception as e:
             print(e, flush=True)
             self.lat_ref, self.lon_ref = 0.0, 0.0
-        self._route_planner = RoutePlanner(self.route_planner_min_distance, self.route_planner_max_distance,
+        route_plan = self._global_plan
+        route_uses_gps = True
+        route_min_distance = self.route_planner_min_distance
+        if self.parking_exit_route_fix:
+            try:
+                vehicle = getattr(self, "hero_actor", None)
+                if vehicle is None and CarlaDataProvider is not None:
+                    vehicle = CarlaDataProvider.get_hero_actor()
+
+                first_transform = self._global_plan_world_coord[0][0]
+                vehicle_transform = vehicle.get_transform()
+                route_start_distance = first_transform.location.distance(vehicle_transform.location)
+
+                if route_start_distance > 2.0:
+                    offset = vehicle_transform.location - first_transform.location
+                    right_vec = first_transform.get_right_vector()
+                    lateral_offset = offset.x * right_vec.x + offset.y * right_vec.y
+                    merge_command = RoadOption.CHANGELANELEFT if lateral_offset > 0.0 else RoadOption.CHANGELANERIGHT
+                    self._parking_exit_route_fix_active = True
+                    self._parking_exit_merge_side = -1 if merge_command == RoadOption.CHANGELANELEFT else 1
+
+                    converter = RoutePlanner(route_min_distance, self.route_planner_max_distance,
+                                             self.lat_ref, self.lon_ref)
+                    first_gps = self._global_plan[0][0]
+                    first_converted = converter.convert_gps_to_carla(
+                        np.array([first_gps["lat"], first_gps["lon"], first_gps["z"]])
+                    )
+                    first_world = np.array([
+                        first_transform.location.x,
+                        first_transform.location.y,
+                        first_transform.location.z,
+                    ])
+                    coordinate_offset = first_converted - first_world
+
+                    def shifted_transform(transform):
+                        location = transform.location
+                        return carla.Transform(
+                            carla.Location(
+                                x=float(location.x + coordinate_offset[0]),
+                                y=float(location.y + coordinate_offset[1]),
+                                z=float(location.z + coordinate_offset[2]),
+                            ),
+                            transform.rotation,
+                        )
+
+                    route_plan = (
+                        [(shifted_transform(vehicle_transform), merge_command)] +
+                        [(shifted_transform(transform), command) for transform, command in self._global_plan_world_coord]
+                    )
+                    route_uses_gps = False
+                    route_min_distance = min(route_min_distance, 1.0)
+                    geometry_debug = self._parking_exit_geometry_debug(
+                        vehicle_transform,
+                        first_transform,
+                    )
+                    print(
+                        "ParkingExit route fix active: "
+                        f"start_distance={route_start_distance:.3f} "
+                        f"lateral_offset={lateral_offset:.3f} "
+                        f"merge_command={merge_command.name} "
+                        f"route_min_distance={route_min_distance:.3f} "
+                        f"coordinate_offset=({coordinate_offset[0]:.3f},"
+                        f"{coordinate_offset[1]:.3f},{coordinate_offset[2]:.3f}) "
+                        f"{geometry_debug}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "ParkingExit route fix enabled but inactive: "
+                        f"start_distance={route_start_distance:.3f}",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(f"ParkingExit route fix setup failed: {exc}", flush=True)
+
+        self._route_planner = RoutePlanner(route_min_distance, self.route_planner_max_distance,
                                                                              self.lat_ref, self.lon_ref)
-        self._route_planner.set_route(self._global_plan, True)
+        self._route_planner.set_route(route_plan, route_uses_gps)
+        self._setup_carla_debug_handles()
         self.initialized = True
         self.metric_info = {}
+
+    def _parking_exit_geometry_debug(self, vehicle_transform, first_route_transform):
+        if CarlaDataProvider is None:
+            return "geometry=unavailable:no_carla_provider"
+        try:
+            world_map = CarlaDataProvider.get_map()
+        except Exception as exc:
+            return f"geometry=unavailable:{type(exc).__name__}"
+        if world_map is None:
+            return "geometry=unavailable:no_map"
+
+        def describe(name, transform):
+            try:
+                waypoint = world_map.get_waypoint(
+                    transform.location,
+                    project_to_road=True,
+                    lane_type=carla.LaneType.Any,
+                )
+            except Exception as exc:
+                return f"{name}=error:{type(exc).__name__}"
+            if waypoint is None:
+                return f"{name}=none"
+
+            def neighbor(label, neighbor_waypoint):
+                if neighbor_waypoint is None:
+                    return f"{label}:none"
+                return (
+                    f"{label}:road{neighbor_waypoint.road_id}/"
+                    f"lane{neighbor_waypoint.lane_id}/"
+                    f"{str(neighbor_waypoint.lane_type).replace(' ', '_')}"
+                )
+
+            left = None
+            right = None
+            try:
+                left = waypoint.get_left_lane()
+            except Exception:
+                left = None
+            try:
+                right = waypoint.get_right_lane()
+            except Exception:
+                right = None
+
+            return (
+                f"{name}=road{waypoint.road_id}/lane{waypoint.lane_id}/"
+                f"{str(waypoint.lane_type).replace(' ', '_')}/"
+                f"yaw{waypoint.transform.rotation.yaw:.1f}/"
+                f"width{waypoint.lane_width:.1f}/"
+                f"{neighbor('left', left)}/"
+                f"{neighbor('right', right)}"
+            )
+
+        return (
+            "geometry="
+            f"{describe('ego', vehicle_transform)};"
+            f"{describe('route0', first_route_transform)}"
+        )
+
+    def _setup_carla_debug_handles(self):
+        if CarlaDataProvider is None:
+            return
+        try:
+            self._vehicle = getattr(self, "hero_actor", None) or CarlaDataProvider.get_hero_actor()
+            if self._vehicle is None:
+                return
+            self._world = self._vehicle.get_world()
+            self.world_map = CarlaDataProvider.get_map()
+        except Exception as exc:
+            print(f"CARLA debug handle setup failed: {exc}", flush=True)
+            return
+
+        if not self.debug_collision or self._debug_collision_sensor is not None:
+            return
+        try:
+            blueprint = self._world.get_blueprint_library().find("sensor.other.collision")
+            self._debug_collision_sensor = self._world.spawn_actor(
+                blueprint,
+                carla.Transform(),
+                attach_to=self._vehicle,
+            )
+            self._debug_collision_sensor.listen(self._on_debug_collision)
+            print("CARLA debug collision sensor attached", flush=True)
+        except Exception as exc:
+            print(f"CARLA debug collision sensor setup failed: {exc}", flush=True)
+
+    def _on_debug_collision(self, event):
+        impulse = event.normal_impulse
+        intensity = math.sqrt(impulse.x ** 2 + impulse.y ** 2 + impulse.z ** 2)
+        other_actor = event.other_actor
+        other_type = getattr(other_actor, "type_id", "unknown")
+        other_id = getattr(other_actor, "id", -1)
+        collision = {
+            "step": int(getattr(self, "step", -1)),
+            "frame": int(getattr(event, "frame", -1)),
+            "other_id": int(other_id),
+            "other_type": str(other_type),
+            "intensity": float(intensity),
+        }
+        self._debug_collision_events.append(collision)
+        self._last_collision_debug = collision
+        print(
+            "CARLA collision "
+            f"step={collision['step']} frame={collision['frame']} "
+            f"other_id={collision['other_id']} other_type={collision['other_type']} "
+            f"intensity={collision['intensity']:.3f}",
+            flush=True,
+        )
+
+    def _get_world_debug(self):
+        debug = {
+            "world_speed": float("nan"),
+            "ego_z": float("nan"),
+            "ego_pitch": float("nan"),
+            "ego_roll": float("nan"),
+            "lane_dist": float("nan"),
+            "road_id": "none",
+            "lane_id": "none",
+            "lane_type": "none",
+            "collision_count": len(getattr(self, "_debug_collision_events", [])),
+            "last_collision": "none",
+        }
+        vehicle = getattr(self, "_vehicle", None) or getattr(self, "hero_actor", None)
+        if vehicle is not None:
+            try:
+                transform = vehicle.get_transform()
+                location = transform.location
+                velocity = vehicle.get_velocity()
+                debug["world_speed"] = float(velocity.length())
+                debug["ego_z"] = float(location.z)
+                debug["ego_pitch"] = float(transform.rotation.pitch)
+                debug["ego_roll"] = float(transform.rotation.roll)
+
+                world_map = getattr(self, "world_map", None)
+                if world_map is not None:
+                    waypoint = world_map.get_waypoint(
+                        location,
+                        project_to_road=True,
+                        lane_type=carla.LaneType.Any,
+                    )
+                    if waypoint is not None:
+                        debug["lane_dist"] = float(location.distance(waypoint.transform.location))
+                        debug["road_id"] = int(waypoint.road_id)
+                        debug["lane_id"] = int(waypoint.lane_id)
+                        debug["lane_type"] = str(waypoint.lane_type).replace(" ", "_")
+            except Exception as exc:
+                debug["lane_type"] = f"debug_error:{type(exc).__name__}"
+
+        last_collision = getattr(self, "_last_collision_debug", None)
+        if last_collision is not None:
+            debug["last_collision"] = (
+                f"step{last_collision['step']}:"
+                f"{last_collision['other_type']}:"
+                f"{last_collision['intensity']:.2f}"
+            )
+        return debug
+
+    def _find_parking_exit_hazard(self, include_same_lane=False):
+        if not (self.parking_exit_yield and self._parking_exit_route_fix_active):
+            return None
+        if self.step > self.parking_exit_yield_steps:
+            return None
+
+        vehicle = getattr(self, "_vehicle", None) or getattr(self, "hero_actor", None)
+        world = getattr(self, "_world", None)
+        merge_side = getattr(self, "_parking_exit_merge_side", 0)
+        if vehicle is None or world is None or merge_side == 0:
+            return None
+
+        try:
+            ego_transform = vehicle.get_transform()
+            ego_location = ego_transform.location
+            forward_vec = ego_transform.get_forward_vector()
+            right_vec = ego_transform.get_right_vector()
+            actors = world.get_actors().filter("vehicle.*")
+        except Exception:
+            return None
+
+        best_hazard = None
+        world_map = getattr(self, "world_map", None)
+        for actor in actors:
+            try:
+                if actor.id == vehicle.id:
+                    continue
+                actor_location = actor.get_location()
+                actor_velocity = actor.get_velocity()
+                rel_x = actor_location.x - ego_location.x
+                rel_y = actor_location.y - ego_location.y
+                rel_z = actor_location.z - ego_location.z
+                longitudinal = rel_x * forward_vec.x + rel_y * forward_vec.y + rel_z * forward_vec.z
+                lateral = rel_x * right_vec.x + rel_y * right_vec.y + rel_z * right_vec.z
+                target_side_lateral = merge_side * lateral
+                distance = math.sqrt(rel_x * rel_x + rel_y * rel_y + rel_z * rel_z)
+                actor_speed = actor_velocity.length()
+            except Exception:
+                continue
+            if distance > self.parking_exit_yield_distance:
+                continue
+
+            in_merge_side = (
+                self.parking_exit_yield_lateral_min
+                <= target_side_lateral
+                <= self.parking_exit_yield_lateral_max
+            )
+            in_longitudinal_window = (
+                -6.0
+                <= longitudinal
+                <= self.parking_exit_yield_longitudinal
+            )
+            in_same_lane = (
+                include_same_lane
+                and abs(lateral) <= 2.2
+                and -4.0 <= longitudinal <= min(self.parking_exit_yield_longitudinal, 12.0)
+            )
+            if not ((in_merge_side and in_longitudinal_window) or in_same_lane):
+                continue
+
+            candidate = {
+                "id": int(actor.id),
+                "type": str(getattr(actor, "type_id", "vehicle")),
+                "distance": float(distance),
+                "longitudinal": float(longitudinal),
+                "lateral": float(lateral),
+                "speed": float(actor_speed),
+                "road_id": "none",
+                "lane_id": "none",
+                "lane_type": "none",
+            }
+            if world_map is not None:
+                try:
+                    actor_waypoint = world_map.get_waypoint(
+                        actor_location,
+                        project_to_road=True,
+                        lane_type=carla.LaneType.Any,
+                    )
+                    if actor_waypoint is not None:
+                        candidate["road_id"] = int(actor_waypoint.road_id)
+                        candidate["lane_id"] = int(actor_waypoint.lane_id)
+                        candidate["lane_type"] = str(actor_waypoint.lane_type).replace(" ", "_")
+                except Exception:
+                    candidate["lane_type"] = "lane_debug_error"
+            if best_hazard is None or candidate["distance"] < best_hazard["distance"]:
+                best_hazard = candidate
+
+        return best_hazard
+
+    def _tensor_path_to_numpy(self, path_tensor):
+        if path_tensor is None:
+            return None
+        try:
+            path = path_tensor[0].detach().cpu().numpy()
+        except Exception:
+            return None
+        path = np.asarray(path, dtype=np.float32).reshape(-1, 2)
+        if path.size == 0:
+            return None
+        finite = np.isfinite(path).all(axis=1)
+        path = path[finite]
+        if len(path) == 0:
+            return None
+        return path
+
+    def _path_vs_hazard_metrics(self, path_tensor, hazard):
+        path = self._tensor_path_to_numpy(path_tensor)
+        if path is None or hazard is None:
+            return None
+
+        hazard_xy = np.array(
+            [float(hazard["longitudinal"]), float(hazard["lateral"])],
+            dtype=np.float32,
+        )
+        dists = np.linalg.norm(path - hazard_xy[None, :], axis=1)
+        nearest_idx = int(np.argmin(dists))
+        nearest = path[nearest_idx]
+
+        longitudinal_idx = int(np.argmin(np.abs(path[:, 0] - hazard_xy[0])))
+        longitudinal_nearest = path[longitudinal_idx]
+        return {
+            "min": float(dists[nearest_idx]),
+            "nearest_x": float(nearest[0]),
+            "nearest_y": float(nearest[1]),
+            "nearest_dx": float(nearest[0] - hazard_xy[0]),
+            "nearest_dy": float(nearest[1] - hazard_xy[1]),
+            "y_at_hazard_x": float(longitudinal_nearest[1]),
+            "dy_at_hazard_x": float(longitudinal_nearest[1] - hazard_xy[1]),
+        }
+
+    def _parking_exit_waypoint_hazard_debug(self, pred_route, pred_speed_wps, planner_route):
+        if not self.debug_waypoint_hazard:
+            return ""
+
+        hazard = self._find_parking_exit_hazard(include_same_lane=True)
+        if hazard is None:
+            return "hazard_present=0 "
+
+        hazard_static = int(hazard["speed"] <= self.parking_exit_nudge_static_speed)
+        parts = [
+            "hazard_present=1",
+            f"hazard_distance={hazard['distance']:.3f}",
+            f"hazard_longitudinal={hazard['longitudinal']:.3f}",
+            f"hazard_lateral={hazard['lateral']:.3f}",
+            f"hazard_speed={hazard['speed']:.3f}",
+            f"hazard_static={hazard_static}",
+        ]
+
+        metric_inputs = (
+            ("model_route", pred_route),
+            ("speed_wps", pred_speed_wps),
+            ("planner_route", planner_route),
+        )
+        for prefix, path_tensor in metric_inputs:
+            metrics = self._path_vs_hazard_metrics(path_tensor, hazard)
+            if metrics is None:
+                continue
+            parts.extend(
+                [
+                    f"{prefix}_hazard_min={metrics['min']:.3f}",
+                    f"{prefix}_hazard_x={metrics['nearest_x']:.3f}",
+                    f"{prefix}_hazard_y={metrics['nearest_y']:.3f}",
+                    f"{prefix}_hazard_dx={metrics['nearest_dx']:.3f}",
+                    f"{prefix}_hazard_dy={metrics['nearest_dy']:.3f}",
+                    f"{prefix}_hazard_y_at_x={metrics['y_at_hazard_x']:.3f}",
+                    f"{prefix}_hazard_dy_at_x={metrics['dy_at_hazard_x']:.3f}",
+                ]
+            )
+        return " ".join(parts) + " "
+
+    def _apply_parking_exit_yield_guard(self, steer, throttle, brake, world_debug):
+        self._last_parking_exit_yield_debug = "off"
+        if not (self.parking_exit_yield and self._parking_exit_route_fix_active):
+            return steer, throttle, brake, False
+        if self.step > self.parking_exit_yield_steps:
+            self._last_parking_exit_yield_debug = "expired"
+            return steer, throttle, brake, False
+
+        lane_type = str(world_debug.get("lane_type", ""))
+        in_driving_lane = "Driving" in lane_type
+        hazard = self._find_parking_exit_hazard(include_same_lane=in_driving_lane)
+        if hazard is not None:
+            hazard_debug = (
+                f"id{hazard['id']}:{hazard['type']}:"
+                f"d{hazard['distance']:.2f}:x{hazard['longitudinal']:.2f}:"
+                f"y{hazard['lateral']:.2f}:v{hazard['speed']:.2f}:"
+                f"road{hazard['road_id']}:lane{hazard['lane_id']}:{hazard['lane_type']}"
+            )
+            static_nudge = (
+                self.parking_exit_nudge_static
+                and in_driving_lane
+                and hazard["speed"] <= self.parking_exit_nudge_static_speed
+                and hazard["distance"] <= self.parking_exit_nudge_static_distance
+                and abs(hazard["lateral"]) <= self.parking_exit_nudge_static_lateral
+            )
+            if static_nudge:
+                merge_steer = self._parking_exit_merge_side * self.parking_exit_merge_steer
+                throttle_value = min(float(np.asarray(throttle).reshape(-1)[0]), self.parking_exit_creep_throttle)
+                self._last_parking_exit_yield_debug = f"static_nudge:{hazard_debug}"
+                return merge_steer, throttle_value, False, True
+            if self.step <= self.parking_exit_yield_brake_steps or in_driving_lane:
+                self._last_parking_exit_yield_debug = f"yield:{hazard_debug}"
+                return steer, 0.0, True, True
+            if "Parking" in lane_type:
+                merge_steer = self._parking_exit_merge_side * self.parking_exit_merge_steer
+                throttle_value = min(float(np.asarray(throttle).reshape(-1)[0]), self.parking_exit_creep_throttle)
+                self._last_parking_exit_yield_debug = f"gap_creep:{hazard_debug}"
+                return merge_steer, throttle_value, False, True
+
+        if "Parking" in lane_type:
+            merge_steer = self._parking_exit_merge_side * self.parking_exit_merge_steer
+            throttle_value = min(float(np.asarray(throttle).reshape(-1)[0]), self.parking_exit_creep_throttle)
+            self._last_parking_exit_yield_debug = f"creep:{lane_type}"
+            return merge_steer, throttle_value, False, True
+
+        self._last_parking_exit_yield_debug = "clear"
+        return steer, throttle, brake, False
 
     def sensors(self):
         sensors = []
@@ -627,8 +1181,8 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
                     template_inference = conv_module.get_conv_template('internlm2-chat')
                     for conv_part_idx, conv_part in enumerate(conv):
                             if conv_part['role'] == 'assistant':
-                                    # template.append_message(template.roles[1], conv_part['content'])
-                                    template.append_message(template.roles[1], None)
+                                    assistant_content = None if self.model.predict_language else conv_part['content']
+                                    template.append_message(template.roles[1], assistant_content)
                             elif conv_part['role'] == 'user':
                                     if conv_part_idx == 0 and '<image>' not in conv_part['content']:
                                             # add image token
@@ -653,6 +1207,15 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
                     
             prompt_tokenized = self.tokenizer(prompt_batch_list, padding=True, return_tensors="pt", return_offsets_mapping=True, add_special_tokens=False)
             prompt_tokenized_ids = prompt_tokenized["input_ids"]
+            if not getattr(self, "_printed_img_context_debug", False):
+                    img_context_id = self.tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
+                    img_context_count = int((prompt_tokenized_ids == img_context_id).sum().item())
+                    print(
+                            f"CARLA prompt IMG_CONTEXT id={img_context_id} count={img_context_count} "
+                            f"seq_len={prompt_tokenized_ids.shape[1]}",
+                            flush=True,
+                    )
+                    self._printed_img_context_debug = True
             prompt_tokenized_char_offsets = prompt_tokenized["offset_mapping"].view(1, -1, 2)
             prompt_tokenized_valid = prompt_tokenized["input_ids"] != self.tokenizer.pad_token_id
             prompt_tokenized_mask = prompt_tokenized_valid
@@ -672,10 +1235,12 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         self.DrivingInput["camera_extrinsics"] = torch.repeat_interleave(get_camera_extrinsics().unsqueeze(0), 1, dim=0).view(1, 4, 4).float().to(self.device)
         self.DrivingInput["vehicle_speed"] = result['speed'].to(dtype=self.model_dtype)
         self.DrivingInput["target_point"] = result['target_point'].to(device=self.device, dtype=self.model_dtype)
-        if self.cfg.data_module.route_as == 'target_point':
-            self.DrivingInput["map_route"] = result['target_point'].to(device=self.device, dtype=self.model_dtype).unsqueeze(1)
+        self.DrivingInput["prompt"] = ll
+        self.DrivingInput["prompt_inference"] = ll
+        if getattr(self, 'route_as', 'target_point_command') == 'target_point':
+            self.map_route = result['target_point'].to(device=self.device, dtype=self.model_dtype).unsqueeze(1)
         else:
-            self.DrivingInput["map_route"] = None
+            self.map_route = None
 
         return result
 
@@ -695,8 +1260,7 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
 
         # initialize DrivingInput with dict self.DrivingInput
         model_input = DrivingInput(**self.DrivingInput)
-        pred_speed_wps, pred_route = self.model(model_input)
-        language = None
+        pred_speed_wps, pred_route, language = self._unpack_model_output(self.model(model_input))
         pred_speed_wps = pred_speed_wps.float() if pred_speed_wps is not None else None
         pred_route = pred_route.float() if pred_route is not None else None
 
@@ -770,7 +1334,8 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
                 
                 y_start = H + 20 + y_dist*(idx+1)
 
-                lines = textwrap.wrap(f"Answer: {language[0]}", width=line_width)
+                answer_text = language[0] if isinstance(language, (list, tuple)) and len(language) > 0 else "direct driving mode"
+                lines = textwrap.wrap(f"Answer: {answer_text}", width=line_width)
                 for idx, line in enumerate(lines):
                         draw.text((10, y_start + y_dist*(idx)), line, font=font, fill=(255, 255, 255, 255))
 
@@ -779,23 +1344,36 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
             cv2.imshow('SimLingo Agent Vision', cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR))
             cv2.waitKey(1)
             
-        steer, throttle, brake = self.control_pid(pred_route, gt_velocity, pred_speed_wps)
+        steer_route = pred_route
+        planner_route = tick_data.get("route")
+        if self.steer_source == "planner" and planner_route is not None:
+            steer_route = planner_route.float()
 
-        # # 0.1 is just an arbitrary low number to threshold when the car is stopped
-        if gt_velocity < 0.1:
-            self.stuck_detector += 1
-        else:
+        steer, throttle, brake = self.control_pid(steer_route, gt_velocity, pred_speed_wps)
+        world_debug_guard = self._get_world_debug()
+        steer, throttle, brake, parking_exit_guard = self._apply_parking_exit_yield_guard(
+            steer, throttle, brake, world_debug_guard
+        )
+
+        if parking_exit_guard:
             self.stuck_detector = 0
+            self.force_move = 0
+        else:
+            # # 0.1 is just an arbitrary low number to threshold when the car is stopped
+            if gt_velocity < 0.1:
+                self.stuck_detector += 1
+            else:
+                self.stuck_detector = 0
 
-        # Restart mechanism in case the car got stuck. Not used a lot anymore but doesn't hurt to keep it.
-        if self.stuck_detector > self.config.stuck_threshold:
-            self.force_move = self.config.creep_duration
+            # Restart mechanism in case the car got stuck. Not used a lot anymore but doesn't hurt to keep it.
+            if self.stuck_detector > self.config.stuck_threshold:
+                self.force_move = self.config.creep_duration
 
-        if self.force_move > 0:
-            throttle = max(self.config.creep_throttle, throttle)
-            brake = False
-            self.force_move -= 1
-            print(f"force_move: {self.force_move}")
+            if self.force_move > 0:
+                throttle = max(self.config.creep_throttle, throttle)
+                brake = False
+                self.force_move -= 1
+                print(f"force_move: {self.force_move}")
 
         control = carla.VehicleControl(steer=float(steer), throttle=float(throttle), brake=float(brake))
 
@@ -805,6 +1383,55 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
             self.control = carla.VehicleControl(0.0, 0.0, 1.0)
         else:
             self.control = control
+
+        if self.debug_control and self.step % self.debug_control_freq == 0:
+            speed_scalar = float(gt_velocity.item()) if hasattr(gt_velocity, "item") else float(gt_velocity)
+            route0 = None
+            wps0 = None
+            pid_debug = getattr(self, "_last_control_pid_debug", {})
+            world_debug = self._get_world_debug()
+            desired_speed = float(pid_debug.get("desired_speed", float("nan")))
+            desired_speed_raw = float(pid_debug.get("desired_speed_raw", float("nan")))
+            delta = float(pid_debug.get("delta", float("nan")))
+            gps_debug = tick_data.get("gps")
+            if hasattr(gps_debug, "tolist"):
+                gps_debug = gps_debug.tolist()
+            compass_debug = tick_data.get("compass", float("nan"))
+            if compass_debug is None:
+                compass_debug = float("nan")
+            compass_debug = float(compass_debug.item()) if hasattr(compass_debug, "item") else float(compass_debug)
+            if pred_route is not None:
+                route0 = pred_route[0, 0].detach().cpu().tolist()
+            if pred_speed_wps is not None:
+                wps0 = pred_speed_wps[0, 0].detach().cpu().tolist()
+            hazard_path_debug = self._parking_exit_waypoint_hazard_debug(
+                pred_route,
+                pred_speed_wps,
+                planner_route,
+            )
+            print(
+                "CARLA control "
+                f"step={self.step} speed={speed_scalar:.3f} "
+                f"steer={self.control.steer:.3f} throttle={self.control.throttle:.3f} "
+                f"brake={self.control.brake:.3f} desired_speed={desired_speed:.3f} "
+                f"desired_speed_raw={desired_speed_raw:.3f} speed_scale={self.speed_scale:.3f} "
+                f"min_desired_speed={self.min_desired_speed:.3f} "
+                f"delta={delta:.3f} stuck={self.stuck_detector} force_move={self.force_move} "
+                f"parking_exit_yield={self._last_parking_exit_yield_debug} "
+                f"steer_source={self.steer_source} "
+                f"world_speed={world_debug['world_speed']:.3f} "
+                f"lane_dist={world_debug['lane_dist']:.3f} "
+                f"road_id={world_debug['road_id']} lane_id={world_debug['lane_id']} "
+                f"lane_type={world_debug['lane_type']} ego_z={world_debug['ego_z']:.3f} "
+                f"ego_pitch={world_debug['ego_pitch']:.3f} ego_roll={world_debug['ego_roll']:.3f} "
+                f"collision_count={world_debug['collision_count']} "
+                f"last_collision={world_debug['last_collision']} "
+                f"{hazard_path_debug}"
+                f"gps={gps_debug} compass={compass_debug:.3f} "
+                f"target={self.target_points[0] if self.target_points else None} "
+                f"pred_route0={route0} pred_wps0={wps0}",
+                flush=True,
+            )
             
         metric_info = self.get_metric_info()
         self.metric_info[self.step] = metric_info
@@ -814,7 +1441,7 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
                 json.dump(self.metric_info, outfile, indent=4)
                 outfile.close()
 
-        return control
+        return self.control
 
     def control_pid(self, route_waypoints, velocity, speed_waypoints):
         """
@@ -829,9 +1456,14 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         # m / s required to drive
         one_second = int(self.config.carla_fps // (self.config.wp_dilation * self.config.data_save_freq))
         half_second = one_second // 2
-        desired_speed = np.linalg.norm(speed_waypoints[half_second - 2] - speed_waypoints[one_second - 2]) * 2.0
+        desired_speed_raw = np.linalg.norm(speed_waypoints[half_second - 2] - speed_waypoints[one_second - 2]) * 2.0
+        desired_speed = desired_speed_raw * self.speed_scale
+        desired_speed = max(desired_speed, self.min_desired_speed)
+        if self.max_desired_speed > 0.0:
+            desired_speed = min(desired_speed, self.max_desired_speed)
 
-        brake = ((desired_speed < self.config.brake_speed) or ((speed / desired_speed) > self.config.brake_ratio))
+        desired_speed_for_ratio = max(float(desired_speed), 1e-3)
+        brake = ((desired_speed < self.config.brake_speed) or ((speed / desired_speed_for_ratio) > self.config.brake_ratio))
 
         delta = np.clip(desired_speed - speed, 0.0, self.config.clip_delta)
         throttle = self.speed_controller.step(float(delta))
@@ -844,6 +1476,23 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
 
         steer = np.clip(steer, -1.0, 1.0)
         steer = round(steer, 3)
+
+        delta_value = float(np.asarray(delta).reshape(-1)[0])
+        throttle_value = float(np.asarray(throttle).reshape(-1)[0])
+        brake_value = bool(np.asarray(brake).reshape(-1)[0])
+
+        self._last_control_pid_debug = {
+            "desired_speed": float(desired_speed),
+            "desired_speed_raw": float(desired_speed_raw),
+            "speed_scale": float(self.speed_scale),
+            "min_desired_speed": float(self.min_desired_speed),
+            "max_desired_speed": float(self.max_desired_speed),
+            "delta": delta_value,
+            "speed": float(np.asarray(speed).reshape(-1)[0]),
+            "throttle": throttle_value,
+            "brake": brake_value,
+            "route_interp_len": int(len(route_interp)),
+        }
 
         return steer, throttle, brake
     
@@ -879,9 +1528,20 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         Also writes logging files to disk.
         """
 
-        del self.model
-        del self.config
-        if self.cfg.data_module.encoder == 'llavanext':
+        collision_sensor = getattr(self, "_debug_collision_sensor", None)
+        if collision_sensor is not None:
+            try:
+                collision_sensor.stop()
+                collision_sensor.destroy()
+            except Exception as exc:
+                print(f"CARLA debug collision sensor cleanup failed: {exc}", flush=True)
+            self._debug_collision_sensor = None
+
+        if hasattr(self, "model"):
+            del self.model
+        if hasattr(self, "config"):
+            del self.config
+        if hasattr(self, "cfg") and self.cfg.data_module.get('encoder') == 'llavanext':
             del self.processor
 
 

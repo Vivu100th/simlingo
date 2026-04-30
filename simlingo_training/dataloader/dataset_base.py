@@ -29,6 +29,23 @@ from simlingo_training.utils.projection import get_camera_intrinsics, project_po
 
 VIZ_DATA = False
 
+def _resolve_repo_path(start_dir):
+    path = Path(start_dir).resolve()
+    for candidate in (path, *path.parents):
+        if (candidate / "data" / "augmented_templates").exists():
+            return str(candidate)
+        if (candidate / ".git").exists() and (candidate / "simlingo_training").exists():
+            return str(candidate)
+    return str(path)
+
+
+def _resolve_repo_child(repo_path, child_path):
+    path = Path(child_path)
+    if path.is_absolute():
+        return str(path)
+    return str(Path(repo_path) / path)
+
+
 class BaseDataset(Dataset):  # pylint: disable=locally-disabled, invalid-name
     """
     Base class for the dataset.
@@ -47,7 +64,7 @@ class BaseDataset(Dataset):  # pylint: disable=locally-disabled, invalid-name
         filter_infractions_per_route = True
 
         self.rgb_folder = 'rgb'
-        self.dreamer_folder = 'dreamer'
+        self.dreamer_folder = getattr(self, 'dreamer_folder', 'dreamer')
         
         self.images = []
         self.boxes = []
@@ -64,7 +81,9 @@ class BaseDataset(Dataset):  # pylint: disable=locally-disabled, invalid-name
 
         fail_reasons = {}
 
-        repo_path = get_original_cwd()
+        repo_path = _resolve_repo_path(get_original_cwd())
+        data_path = _resolve_repo_child(repo_path, self.data_path)
+        bucket_path = _resolve_repo_child(repo_path, self.bucket_path)
         
         # load templates
         template_file = f"{repo_path}/data/augmented_templates/commentary_augmented.json"
@@ -141,7 +160,7 @@ class BaseDataset(Dataset):  # pylint: disable=locally-disabled, invalid-name
 
 
         if not self.bucket_name == "all":
-            with open(f"{repo_path}/" + self.bucket_path + '/buckets_paths.pkl', 'rb') as f:
+            with open(f"{bucket_path}/buckets_paths.pkl", 'rb') as f:
                 bucket_dict = pkl.load(f)
 
             bucket_run_ids = None
@@ -179,23 +198,22 @@ class BaseDataset(Dataset):  # pylint: disable=locally-disabled, invalid-name
                     run_id_path = Path(run_id)
                     run_id_parent = run_id_path.parent
                     run_id_name = run_id_path.name
-                    run_id_absolut = str(run_id_parent)
-                    run_id_absolut = f"{repo_path}/{str(run_id_parent)}"
+                    run_id_absolut = _resolve_repo_child(repo_path, str(run_id_parent))
                     if run_id_absolut not in run_id_dict:
                         run_id_dict[run_id_absolut] = [run_id_name]
                     else:
                         run_id_dict[run_id_absolut].append(run_id_name)
 
 
-        route_dirs = glob.glob(f"{repo_path}/" + self.data_path + '/data/simlingo/*/*/*/Town*')
-        print(f'Found {len(route_dirs)} routes in {repo_path + self.data_path}')
+        route_dirs = glob.glob(f"{data_path}/data/simlingo/*/*/*/Town*")
+        print(f'Found {len(route_dirs)} routes in {data_path}')
         
         if not self.use_old_towns:
             route_dirs = [route_dir for route_dir in route_dirs if 'lb1_split' not in route_dir]
-            print(f'Found {len(route_dirs)} routes in {repo_path + self.data_path} after filtering out old towns')
+            print(f'Found {len(route_dirs)} routes in {data_path} after filtering out old towns')
         elif self.use_only_old_towns or self.bucket_name == "old_towns":
             route_dirs = [route_dir for route_dir in route_dirs if 'lb1_split' in route_dir]
-            print(f'Found {len(route_dirs)} routes in {repo_path + self.data_path} after filtering out non old towns')
+            print(f'Found {len(route_dirs)} routes in {data_path} after filtering out non old towns')
         
 
         random.shuffle(route_dirs)
@@ -208,7 +226,11 @@ class BaseDataset(Dataset):  # pylint: disable=locally-disabled, invalid-name
             elif self.split == "val":
                 print("Using Town13 for validation")
                 route_dirs = [route_dir for route_dir in route_dirs if 'routes_validation' in route_dir]
-                route_dirs = route_dirs[:int(0.02 * len(route_dirs))]
+                num_val_routes = int(getattr(self, 'val_route_fraction', 0.02) * len(route_dirs))
+                if route_dirs:
+                    num_val_routes = max(getattr(self, 'min_val_routes', 1), num_val_routes)
+                    num_val_routes = min(len(route_dirs), num_val_routes)
+                route_dirs = route_dirs[:num_val_routes]
         else:
             # use all towns
             if self.split == "train":

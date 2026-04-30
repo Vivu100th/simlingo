@@ -58,7 +58,7 @@ class DrivingModel(pl.LightningModule):
     ):
         super().__init__()
 
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["vision_model", "language_model"])
         self.vision_model = vision_model
         self.language_model = language_model
         self.lr = lr

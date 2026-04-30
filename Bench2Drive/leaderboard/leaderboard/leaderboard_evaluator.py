@@ -206,7 +206,7 @@ class LeaderboardEvaluator(object):
         """
         self.carla_path = os.environ["CARLA_ROOT"]
         args.port = find_free_port(args.port)
-        cmd1 = f"{os.path.join(self.carla_path, 'CarlaUE4.sh')} -RenderOffScreen -nosound -carla-rpc-port={args.port} -graphicsadapter={args.gpu_rank}"
+        cmd1 = f"{os.path.join(self.carla_path, 'CarlaUE4.sh')} -RenderOffScreen -nosound -quality-level=Low -carla-rpc-port={args.port} -graphicsadapter={args.gpu_rank}"
         self.server = subprocess.Popen(cmd1, shell=True, preexec_fn=os.setsid)
         print(cmd1, self.server.returncode, flush=True)
         atexit.register(os.killpg, self.server.pid, signal.SIGKILL)
@@ -323,7 +323,7 @@ class LeaderboardEvaluator(object):
 
         # Prepare the statistics of the route
         route_name = f"{config.name}_rep{config.repetition_index}"
-        scenario_name = config.scenario_configs[0].name
+        scenario_name = config.scenario_configs[0].name if config.scenario_configs else "NoScenario"
         town_name = str(config.town)
         weather_id = get_weather_id(config.weather[0][1])
         currentDateAndTime = datetime.now()
@@ -504,7 +504,7 @@ class LeaderboardEvaluator(object):
             self.statistics_manager.validate_and_write_statistics(self.sensors_initialized, crashed)
         
         if crashed:
-            cmd2 = "ps -ef | grep '-graphicsadapter="+ str(args.gpu_rank) + "' | grep -v grep | awk '{print $2}' | xargs -r kill -9"
+            cmd2 = "ps -ef | grep -- '-graphicsadapter="+ str(args.gpu_rank) + "' | grep -v grep | awk '{print $2}' | xargs -r kill -9"
             server = subprocess.Popen(cmd2, shell=True, preexec_fn=os.setsid)
             atexit.register(os.killpg, server.pid, signal.SIGKILL)
 

@@ -1,11 +1,50 @@
 viz
+
+# Local CARLA/SimLingo datasets and generated artifacts
 database/
 pretrained/
 results/
 outputs/
+simlingo_training/outputs/
+simlingo_training/pretrained/
+simlingo_base_training/outputs/
 eval/
 eval_results/
-pretrained/
+eval_outputs/
+logs/
+
+# MTID generated data. Keep source/docs/tests in mtid/, but not generated labels.
+!mtid/outputs/
+mtid/outputs/*
+!mtid/outputs/.gitignore
+mtid/experiments/*
+!mtid/experiments/.gitignore
+!mtid/experiments/README.md
+
+# Training/evaluation run internals
+wandb/
+lightning_logs/
+**/.hydra/
+**/checkpoints/
+**/predictions/
+**/debug_viz/
+**/metric_info/
+
+# Large model/checkpoint artifacts
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+pytorch_model*.bin
+mp_rank_*_model_states.pt
+zero_pp_rank_*.pt
+global_step*/
+
+# Local process/log sidecars
+*.pid
+*.tmux
+*.logpath
+events.out.tfevents*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -28,10 +28,72 @@ class Eval_Dreamer(BaseDataset):  # pylint: disable=locally-disabled, invalid-na
         ):
         super().__init__(dreamer=True, **cfg)
 
+    def _rng_for_index(self, index):
+        if getattr(self, "eval_deterministic", False):
+            return random.Random(int(getattr(self, "eval_seed", 42)) + int(index))
+        return random
+
+    def _choose_safety_activation(self, index, rng):
+        if not self.use_safety_flag:
+            return None
+
+        if not getattr(self, "eval_deterministic", False):
+            return rng.random() < 0.5
+
+        policy = getattr(self, "eval_safety_policy", "alternate")
+        if policy == "safety":
+            return True
+        if policy == "instruction":
+            return False
+        if policy == "seeded":
+            return rng.random() < 0.5
+        if policy == "alternate":
+            return index % 2 == 0
+        raise ValueError(f"Unknown eval_safety_policy: {policy}")
+
+    def _choose_option(self, options, index, rng):
+        if len(options) == 0:
+            raise ValueError("Dreamer alternative file contains no options.")
+
+        if not getattr(self, "eval_deterministic", False):
+            return rng.choice(options)
+
+        policy = getattr(self, "eval_option_policy", "index")
+        if policy == "first":
+            return options[0]
+        if policy == "last":
+            return options[-1]
+        if policy == "seeded":
+            return options[rng.randrange(len(options))]
+        if policy == "index":
+            return options[index % len(options)]
+        raise ValueError(f"Unknown eval_option_policy: {policy}")
+
+    def _choose_from_list(self, values, rng):
+        if isinstance(values, str):
+            return values
+        if len(values) == 0:
+            return ""
+        return rng.choice(values)
+
+    def _should_include_navigation(self, rng):
+        if not getattr(self, "eval_deterministic", False):
+            return rng.random() < 0.8
+
+        policy = getattr(self, "eval_prompt_policy", "with_navigation")
+        if policy == "with_navigation":
+            return True
+        if policy == "instruction_only":
+            return False
+        if policy == "seeded":
+            return rng.random() < 0.8
+        raise ValueError(f"Unknown eval_prompt_policy: {policy}")
+
     def __getitem__(self, index):
         """Returns the item at index idx. """
         # Disable threading because the data loader will already split in threads.
         cv2.setNumThreads(0)
+        rng = self._rng_for_index(index)
 
         data = {}
         images = self.images[index]
@@ -50,13 +112,7 @@ class Eval_Dreamer(BaseDataset):  # pylint: disable=locally-disabled, invalid-na
         
         data['measurement_path'] = measurement_file_current
 
-        if self.use_safety_flag:
-            if random.random() < 0.5:
-                activate_safety = True
-            else:
-                activate_safety = False
-        else:
-            activate_safety = None
+        activate_safety = self._choose_safety_activation(index, rng)
 
         augment_sample = False
         aug_rotation = 0.0
@@ -92,7 +148,7 @@ class Eval_Dreamer(BaseDataset):  # pylint: disable=locally-disabled, invalid-na
             
             options.extend(option)
 
-        chosen_option = random.choice(options)
+        chosen_option = self._choose_option(options, index, rng)
 
         # replace 'org' with the original route
         if chosen_option['route'] == 'org':
@@ -105,7 +161,7 @@ class Eval_Dreamer(BaseDataset):  # pylint: disable=locally-disabled, invalid-na
         else:
             chosen_option['waypoints'] = np.array(chosen_option['waypoints'])
         
-        chosen_option['dreamer_instruction'] = random.choice(chosen_option['dreamer_instruction'])
+        chosen_option['dreamer_instruction'] = self._choose_from_list(chosen_option['dreamer_instruction'], rng)
 
         dreamer_answer = f"Following the given instruction. Waypoints:"
         if activate_safety is not None:
@@ -125,8 +181,8 @@ class Eval_Dreamer(BaseDataset):  # pylint: disable=locally-disabled, invalid-na
             
         answer = ''
 
-        if random.random() < 0.8:
-            prompt = f"Current speed: {speed_rounded} m/s. {random.choice(target_options)} {chosen_option['dreamer_instruction']}"
+        if self._should_include_navigation(rng):
+            prompt = f"Current speed: {speed_rounded} m/s. {self._choose_from_list(target_options, rng)} {chosen_option['dreamer_instruction']}"
         else:
             prompt = f"Current speed: {speed_rounded} m/s. {chosen_option['dreamer_instruction']}"
             

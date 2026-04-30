@@ -1,0 +1,32 @@
+# @package _global_
+defaults:
+  - mtid_seed1
+
+model:
+  vision_model:
+    freeze: true
+
+data_module:
+  batch_size: 1
+  num_workers: 0
+  driving_dataset: null
+  base_dataset:
+    img_augmentation: False
+    img_shift_augmentation: False
+
+debug: true
+enable_wandb: false
+enable_checkpointing: false
+enable_visualise_callback: false
+fast_dev_run: 0
+max_steps: 1
+limit_train_batches: 1
+limit_val_batches: 1
+num_sanity_val_steps: 0
+log_every_n_steps: 1
+max_epochs: 1
+val_every_n_epochs: 1
+gpus: 1
+precision: bf16-mixed
+strategy: auto
+name: simlingo_mtid_debug

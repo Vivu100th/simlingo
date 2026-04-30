@@ -44,6 +44,7 @@ class DrivingModelConfig:
 class DatasetBaseConfig:
     data_path: str = "/home/katrinrenz/coding/wayve_carla/database/expertv3_2*"
     bucket_path: str = "data/buckets"
+    dreamer_folder: str = "dreamer"
 
     cut_bottom_quarter: bool = False
     use_1d_wps: bool = False
@@ -55,6 +56,8 @@ class DatasetBaseConfig:
     use_old_towns: bool = False
     use_only_old_towns: bool = False
     use_town13: bool = False
+    val_route_fraction: float = 0.02
+    min_val_routes: int = 1
 
     skip_first_n_frames: int = 10
     pred_len: int = 11 # including the current time step
@@ -67,6 +70,11 @@ class DatasetBaseConfig:
     img_shift_augmentation_prob: float = 0.5
     
     use_safety_flag: bool = False
+    eval_deterministic: bool = False
+    eval_seed: int = 42
+    eval_option_policy: str = "index"
+    eval_safety_policy: str = "alternate"
+    eval_prompt_policy: str = "with_navigation"
     
     num_route_points: int = 20
 
@@ -139,13 +147,27 @@ class TrainConfig:
         wandb_name: Optional[str] = f"{time.strftime('%Y_%m_%d_%H_%M_%S')}"
     
     # max_steps: int = 100_000
+    max_steps: Optional[int] = None
+    fast_dev_run: int = 0
+    limit_train_batches: Optional[int] = None
+    limit_val_batches: Optional[int] = None
+    limit_predict_batches: Optional[Union[int, float]] = None
+    enable_checkpointing: bool = True
+    enable_visualise_callback: bool = True
+    num_sanity_val_steps: int = 2
+    log_every_n_steps: int = 50
     max_epochs: int = 20
     precision: str = "16-mixed"
     strategy: str = "deepspeed_stage_2" # deepspeed_stage_2 ddp
-    # val_check_interval: int = 5000
+    val_check_interval: Optional[Union[int, float]] = None
     val_every_n_epochs: int = 1
 
     checkpoint: Optional[str] = None
+
+    eval_mode: str = "Dreaming"
+    eval_load_path: Optional[str] = None
+    eval_batch_size: int = 1
+    eval_num_workers: int = 0
 
 
 def register_configs():

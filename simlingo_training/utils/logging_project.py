@@ -13,14 +13,39 @@ from datetime import datetime
 from hydra.utils import get_original_cwd, to_absolute_path
 
 
+def _resolve_git_root(start_dir):
+    path = Path(start_dir).resolve()
+    for candidate in (path, *path.parents):
+        if (candidate / ".git").exists():
+            return candidate
+
+    try:
+        root = subprocess.check_output(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            stderr=subprocess.DEVNULL,
+        ).decode("ascii").strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return path
+
+    return Path(root)
+
+
+def _git_output(working_dir, *args):
+    return (
+        subprocess.check_output(["git", "-C", str(working_dir), *args])
+        .decode("ascii")
+        .strip()
+    )
+
+
 def setup_logging(cfg, save_folder=None):
     
     if save_folder is None:
-        working_dir = get_original_cwd()
+        working_dir = _resolve_git_root(get_original_cwd())
         save_folder = 'log'
     else:
         # get working dir
-        working_dir = os.getcwd()
+        working_dir = _resolve_git_root(os.getcwd())
         save_folder = save_folder + '/log'
     # Log args
     # Path(save_folder).mkdir(parents=True, exist_ok=True)
@@ -31,24 +56,17 @@ def setup_logging(cfg, save_folder=None):
         json.dump(args.__dict__, f, indent=2)
 
     # Log git
-    sha = (
-        subprocess.check_output(
-            ["git", "-C", f"{working_dir}", "rev-parse", "HEAD"]
-        )
-        .decode("ascii")
-        .strip()
-    )
-    commit = (
-        subprocess.check_output(["git", "-C", f"{working_dir}", "log", "-1"])
-        .decode("ascii")
-        .strip()
-    )
-    branch = (
-        subprocess.check_output(["git", "-C", f"{working_dir}", "branch"])
-        .decode("ascii")
-        .strip()
-    )
-    repo = Repo(working_dir)
+    try:
+        sha = _git_output(working_dir, "rev-parse", "HEAD")
+        commit = _git_output(working_dir, "log", "-1")
+        branch = _git_output(working_dir, "branch")
+        repo = Repo(working_dir)
+        diff = repo.git.diff("HEAD")
+    except Exception as exc:
+        sha = "unavailable"
+        commit = "unavailable"
+        branch = "unavailable"
+        diff = f"Git logging unavailable: {exc}"
 
     with open(os.path.join(save_folder, "git_info.txt"), "w") as f:
         # write current date and time
@@ -58,7 +76,7 @@ def setup_logging(cfg, save_folder=None):
         f.write(f"Git state: {sha}\n")
         f.write(f"Git commit: {commit}\n")
         f.write(f"Git branch: {branch}\n\n")
-        f.write(f"{repo.git.diff('HEAD')}")
+        f.write(diff)
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",

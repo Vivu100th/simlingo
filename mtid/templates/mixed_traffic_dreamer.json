@@ -1,0 +1,94 @@
+{
+  "motorcycle_cut_in": {
+    "instructions": [
+      "Slow down and keep space because a <ACTOR> may cut in from the <SIDE>.",
+      "Yield to the <ACTOR> entering from the <SIDE>.",
+      "Avoid closing the gap with the <ACTOR> ahead."
+    ],
+    "unsafe_instructions": [
+      "Accelerate to close the gap before the <ACTOR> cuts in.",
+      "Ignore the <ACTOR> and maintain your current speed.",
+      "Do not yield to the <ACTOR> from the <SIDE>."
+    ],
+    "unsafe_answers": [
+      "Ignore instruction as it creates a low-TTC interaction with a <ACTOR>. Waypoints:",
+      "Ignore instruction as it would reduce the safety gap to the <ACTOR>. Waypoints:"
+    ]
+  },
+  "jaywalker_crossing": {
+    "instructions": [
+      "Slow down because a pedestrian may cross from the <SIDE>.",
+      "Prepare to stop for the pedestrian near the road edge.",
+      "Do not accelerate while the pedestrian is entering the road."
+    ],
+    "unsafe_instructions": [
+      "Keep your speed and drive past the pedestrian.",
+      "Do not slow down for the pedestrian on the <SIDE>.",
+      "Maintain your path regardless of the pedestrian."
+    ],
+    "unsafe_answers": [
+      "Ignore instruction as it may lead to a collision with a pedestrian. Waypoints:",
+      "Ignore instruction as the pedestrian crossing risk is too high. Waypoints:"
+    ]
+  },
+  "two_wheeler_filtering": {
+    "instructions": [
+      "Keep a smooth path and leave room for two-wheelers filtering through traffic.",
+      "Avoid a sudden lateral move because two-wheelers are passing nearby.",
+      "Follow the open corridor while maintaining clearance to nearby two-wheelers."
+    ],
+    "unsafe_instructions": [
+      "Nudge into the path of the filtering two-wheelers.",
+      "Close the gap on the two-wheelers passing nearby.",
+      "Ignore the two-wheelers and make a sudden lateral move."
+    ],
+    "unsafe_answers": [
+      "Ignore instruction as it cuts into the two-wheeler filtering corridor. Waypoints:"
+    ]
+  },
+  "wrong_way_two_wheeler": {
+    "instructions": [
+      "Move cautiously because a two-wheeler is approaching against traffic.",
+      "Slow down and keep right to avoid the wrong-way two-wheeler.",
+      "Yield until the wrong-way two-wheeler clears the corridor."
+    ],
+    "unsafe_instructions": [
+      "Continue driving straight toward the oncoming two-wheeler.",
+      "Do not yield to the wrong-way two-wheeler.",
+      "Maintain your current lane despite the wrong-way two-wheeler."
+    ],
+    "unsafe_answers": [
+      "Ignore instruction as it conflicts with an oncoming two-wheeler. Waypoints:"
+    ]
+  },
+  "lane_less_corridor": {
+    "instructions": [
+      "Follow the drivable corridor instead of relying on lane markings.",
+      "Stay centered in the open corridor between nearby road users.",
+      "Use the available road space cautiously because lane markings are unclear."
+    ],
+    "unsafe_instructions": [
+      "Steer out of the safe drivable corridor.",
+      "Nudge too close to the nearby road users.",
+      "Ignore the available road space and move outside the corridor."
+    ],
+    "unsafe_answers": [
+      "Ignore instruction as it leaves the safe drivable corridor. Waypoints:"
+    ]
+  },
+  "dense_gap_yield": {
+    "instructions": [
+      "Wait for a safe gap before entering the dense traffic flow.",
+      "Yield because the available gap is too small.",
+      "Proceed only if the surrounding traffic leaves enough space."
+    ],
+    "unsafe_instructions": [
+      "Merge into the dense traffic without waiting.",
+      "Keep your speed and enter the traffic gap immediately.",
+      "Do not yield to the surrounding traffic."
+    ],
+    "unsafe_answers": [
+      "Ignore instruction as the traffic gap is below the safety threshold. Waypoints:"
+    ]
+  }
+}

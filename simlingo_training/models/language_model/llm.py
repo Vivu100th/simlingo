@@ -4,12 +4,16 @@ from transformers import LlamaModel, LlamaConfig, AutoTokenizer, AutoModelForCau
 from transformers import GPTNeoXForCausalLM
 from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
 from transformers import AutoModel, AutoTokenizer
+from transformers.modeling_utils import PreTrainedModel
 
 from typing import Any, Dict, Optional, Tuple
 from torch.nn import functional as F
 
 import torch
 from torch import Tensor, nn
+
+if not hasattr(PreTrainedModel, "all_tied_weights_keys"):
+    PreTrainedModel.all_tied_weights_keys = {}
 
 CONFIGS: Dict[str, Dict[str, Any]] = {
     "debug": dict(num_hidden_layers=2, num_attention_heads=2, hidden_size=32, intermediate_size=64),
@@ -85,7 +89,7 @@ class LLM(nn.Module):
             self.model = self.model.language_model
             self.model.embed_tokens = self.model.base_model.embed_tokens
         elif 'internvl' in self.variant.lower():
-            self.model = AutoModel.from_pretrained(self.variant, trust_remote_code=True)
+            self.model = AutoModel.from_pretrained(self.variant, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True)
             self.model = self.model.language_model
             try:
                 self.model.embed_tokens = self.model.base_model.embed_tokens
@@ -108,6 +112,9 @@ class LLM(nn.Module):
             from peft import LoraConfig
             
             print('Using PEFT model')
+            if hasattr(self.model, "gradient_checkpointing_enable"):
+                self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            
             peft_config = LoraConfig(
                 inference_mode=False, 
                 r=self.lora_r,

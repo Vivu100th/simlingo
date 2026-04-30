@@ -94,7 +94,7 @@ class VisualiseCallback(Callback):
             return
 
         print("Validation visualization!")
-        with torch.cuda.amp.autocast(enabled=True):
+        with torch.autocast('cuda', enabled=True):
             # Forward with sampling
             # waypoints, route, target_speed, language = pl_module.forward(batch, return_language=True)
             speed_wps, route, language = pl_module.forward(batch, return_language=True)
@@ -129,7 +129,7 @@ class VisualiseCallback(Callback):
         if trainer.global_step % self.interval != 0:
             return
 
-        with torch.cuda.amp.autocast(enabled=True):
+        with torch.autocast('cuda', enabled=True):
             # Forward with sampling
             speed_wps, route, language = pl_module.forward(batch, return_language=True)
 

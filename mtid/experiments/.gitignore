@@ -1,0 +1,5 @@
+# Keep this folder for small notes/metadata, but avoid committing large runs.
+*
+!.gitignore
+!README.md
+

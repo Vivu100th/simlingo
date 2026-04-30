@@ -1,0 +1,35 @@
+# @package _global_
+defaults:
+  - mtid_seed1
+
+model:
+  vision_model:
+    freeze: true
+
+data_module:
+  batch_size: 1
+  num_workers: 0
+  dreamer_dataset: null
+  train_partitions: null
+  base_dataset:
+    dreamer_folder: dreamer
+    img_augmentation: false
+    img_shift_augmentation: false
+    use_safety_flag: false
+
+debug: false
+enable_wandb: false
+enable_checkpointing: true
+enable_visualise_callback: false
+fast_dev_run: 0
+max_steps: 1000
+limit_val_batches: 8
+num_sanity_val_steps: 0
+log_every_n_steps: 25
+val_check_interval: 100
+max_epochs: 1
+val_every_n_epochs: 1
+gpus: 1
+precision: bf16-mixed
+strategy: auto
+name: simlingo_internvl_driving_1k

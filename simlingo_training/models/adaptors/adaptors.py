@@ -172,6 +172,7 @@ class DrivingAdaptor(nn.Module):
             size = self.sizes[input_type]
 
             feature = features[:, current_index: current_index + size]
+            feature = feature.to(dtype=self.heads[input_type][0].weight.dtype)
             prediction = self.heads[input_type](feature).cumsum(1)
 
             predictions[input_type] = prediction
@@ -203,6 +204,7 @@ class DrivingAdaptor(nn.Module):
         for i, input_type in enumerate(self.order):
             size = self.sizes[input_type]
             features_tmp = adaptor_features[:, current_index: current_index + size]
+            features_tmp = features_tmp.to(dtype=self.heads[input_type][0].weight.dtype)
             label = locals()[f'label_{input_type}']
 
             prediction = self.heads[input_type](features_tmp).cumsum(1)

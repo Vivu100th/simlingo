@@ -46,7 +46,7 @@ class DrivingModel(pl.LightningModule):
         **cfg,
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["processor", "cfg_data_module"])
         
         for key, value in cfg.items():
             setattr(self, key, value)
@@ -116,11 +116,17 @@ class DrivingModel(pl.LightningModule):
             driving_input = example
         
         if driving_input is not None:
-            adaptor_dict = self.adaptors(example, inference=True)
+            use_inference_prompt = bool(self.predict_language)
+            adaptor_dict = self.adaptors(example, inference=use_inference_prompt)
+            placeholder_values = (
+                driving_input.prompt_inference.placeholder_values
+                if use_inference_prompt
+                else driving_input.prompt.placeholder_values
+            )
             adaptor_dict = self.vision_model.image_encoder.replace_placeholder_tokens(
                     adaptor_dict = adaptor_dict,
                     pixel_values = driving_input.camera_images,
-                    placeholder_values = driving_input.prompt_inference.placeholder_values,
+                    placeholder_values = placeholder_values,
                     wp_encoder = self.wp_encoder,
                 )
             
@@ -176,8 +182,8 @@ class DrivingModel(pl.LightningModule):
                 self.language.append(self.tokenizer.batch_decode(sampled_tokens, skip_special_tokens=True)[0])
         else:
             # single forward pass same as during training so we can use the same function
-            features = self.forward_model(driving_input, adaptor_dict)
-            outputs_by_adaptor = self.adaptors.split_outputs_by_adaptor(adaptor_dict, features)
+            adaptor_features, _ = self.forward_model(driving_input, adaptor_dict)
+            outputs_by_adaptor = self.adaptors.split_outputs_by_adaptor(adaptor_dict, adaptor_features)
             predictions = self.adaptors.driving.get_predictions(outputs_by_adaptor['driving'])
 
             for k, v in predictions.items():
@@ -426,6 +432,98 @@ class DrivingModel(pl.LightningModule):
         samples_all = [i for i in range(len(self.prediction["prompt"]))]
         
         ade_fde = {}
+
+        def add_generic_dreamer_stats(samples, name):
+            ade_fde[f"num_samples_{name}"] = len(samples)
+            if len(samples) == 0:
+                return
+
+            route_preds_sample = route_preds[samples].cpu().numpy()
+            waypoints_preds_sample = waypoints_preds[samples].cpu().numpy()
+            eval_infos_sample = [self.prediction["eval_infos"][i] for i in samples]
+
+            mode_counts = {}
+            allowed_counts = {}
+            route_ade_to_instruction = []
+            route_ade_to_original = []
+            waypoint_ade_to_instruction = []
+            waypoint_ade_to_original = []
+            sample_rows = []
+
+            for i, eval_info in enumerate(eval_infos_sample):
+                sample_idx = samples[i]
+                mode = eval_info.get("mode", "unknown")
+                allowed = str(eval_info.get("allowed", "unknown"))
+                mode_counts[mode] = mode_counts.get(mode, 0) + 1
+                allowed_counts[allowed] = allowed_counts.get(allowed, 0) + 1
+
+                route_pred = route_preds_sample[i]
+                waypoint_pred = waypoints_preds_sample[i]
+                route_instruction = np.asarray(eval_info["new_path"], dtype=np.float32)
+                route_original = np.asarray(eval_info["org_path"], dtype=np.float32)
+                waypoint_instruction = np.asarray(eval_info["new_wps"], dtype=np.float32)
+                waypoint_original = np.asarray(eval_info["org_wps"], dtype=np.float32)
+
+                route_ade_instruction_i = None
+                route_ade_original_i = None
+                waypoint_ade_instruction_i = None
+                waypoint_ade_original_i = None
+
+                if route_pred.shape == route_instruction.shape == route_original.shape:
+                    route_ade_instruction_i = float(np.mean(np.linalg.norm(route_pred - route_instruction, axis=-1)))
+                    route_ade_original_i = float(np.mean(np.linalg.norm(route_pred - route_original, axis=-1)))
+                    route_ade_to_instruction.append(route_ade_instruction_i)
+                    route_ade_to_original.append(route_ade_original_i)
+
+                if waypoint_pred.shape == waypoint_instruction.shape == waypoint_original.shape:
+                    waypoint_ade_instruction_i = float(np.mean(np.linalg.norm(waypoint_pred - waypoint_instruction, axis=-1)))
+                    waypoint_ade_original_i = float(np.mean(np.linalg.norm(waypoint_pred - waypoint_original, axis=-1)))
+                    waypoint_ade_to_instruction.append(waypoint_ade_instruction_i)
+                    waypoint_ade_to_original.append(waypoint_ade_original_i)
+
+                sample_rows.append({
+                    "sample_index": int(sample_idx),
+                    "path": self.prediction["path"][sample_idx],
+                    "mode": mode,
+                    "allowed": allowed,
+                    "prompt": self.prediction["prompt"][sample_idx].replace("<IMG_CONTEXT>", ""),
+                    "pred_language": self.prediction["language"][sample_idx],
+                    "gt_language": self.prediction["language_gt"][sample_idx],
+                    "route_ade_to_instruction": route_ade_instruction_i,
+                    "route_ade_to_original": route_ade_original_i,
+                    "waypoint_ade_to_instruction": waypoint_ade_instruction_i,
+                    "waypoint_ade_to_original": waypoint_ade_original_i,
+                })
+
+            ade_fde[f"mode_counts_{name}"] = mode_counts
+            ade_fde[f"allowed_counts_{name}"] = allowed_counts
+            if len(route_ade_to_instruction) > 0:
+                ade_fde[f"route_ade_to_instruction_{name}"] = float(np.mean(route_ade_to_instruction))
+                ade_fde[f"route_ade_to_original_{name}"] = float(np.mean(route_ade_to_original))
+                ade_fde[f"route_closer_to_instruction_rate_{name}"] = float(np.mean(
+                    np.asarray(route_ade_to_instruction) <= np.asarray(route_ade_to_original)
+                ))
+            if len(waypoint_ade_to_instruction) > 0:
+                ade_fde[f"waypoint_ade_to_instruction_{name}"] = float(np.mean(waypoint_ade_to_instruction))
+                ade_fde[f"waypoint_ade_to_original_{name}"] = float(np.mean(waypoint_ade_to_original))
+                ade_fde[f"waypoint_closer_to_instruction_rate_{name}"] = float(np.mean(
+                    np.asarray(waypoint_ade_to_instruction) <= np.asarray(waypoint_ade_to_original)
+                ))
+
+            save_path_tmp = f"{str(save_prediction_path)}/mtid_samples_{name}_rank_{self.local_rank}.json"
+            if os.path.exists(save_path_tmp):
+                time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                save_path_tmp = f"{str(save_prediction_path)}/mtid_samples_{name}_rank_{self.local_rank}_{time}.json"
+            with open(save_path_tmp, "w") as f:
+                json.dump(sample_rows, f, indent=4)
+
+        for samples, name in [
+            (samples_safety, "safety"),
+            (samples_instruction, "instruction"),
+            (samples_neither, "neither"),
+            (samples_all, "all"),
+        ]:
+            add_generic_dreamer_stats(samples, name)
         
         def get_desired_end_speed(wps):
             wp_freq = 5
@@ -660,6 +758,16 @@ class DrivingModel(pl.LightningModule):
                                 success_rate_by_mode[mode].append(0)
                                 success_rate_by_allowed[allowed].append(0)
 
+                elif mode in {
+                    'jaywalker_crossing',
+                    'motorcycle_cut_in',
+                    'two_wheeler_filtering',
+                    'wrong_way_two_wheeler',
+                    'dense_gap_yield',
+                    'lane_less_corridor',
+                }:
+                    paths_by_mode[mode].append(sample_path)
+
                 else:
                     print(f"Unknown mode: {mode} in sample {i} with path {sample_path}")
                                 
@@ -694,7 +802,7 @@ class DrivingModel(pl.LightningModule):
             ade_route = np.mean(np.linalg.norm(route_preds_sample - route_gt_sample, axis=-1), axis=-1)
             
             ade_fde.update({
-                f"num_samples_{name}": len(ade_route),
+                f"legacy_num_samples_{name}": len(ade_route),
             })
 
         save_path_tmp = f"{str(save_prediction_path)}/dreamer_results_rank_{self.local_rank}.json"
@@ -727,6 +835,6 @@ class DrivingModel(pl.LightningModule):
         else:
             max_steps = self.trainer.max_steps
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=self.lr, total_steps=max_steps, pct_start=self.pct_start, verbose=False
+            optimizer, max_lr=self.lr, total_steps=max_steps, pct_start=self.pct_start
         )
         return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "frequency": 1, "interval": "step"}}

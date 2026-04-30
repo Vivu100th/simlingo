@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+  - internvl_driving_1k
+
+data_module:
+  base_dataset:
+    data_path: database/simlingo_v2_all_clean
+
+name: simlingo_internvl_driving_clean_1k

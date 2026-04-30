@@ -1,11 +1,15 @@
 import os
+import sys
 from pathlib import Path
+
+repo_root = Path(__file__).resolve().parents[1]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
 
 import hydra
 import pytorch_lightning as pl
 import torch
-from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 from pytorch_lightning import Trainer
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -13,28 +17,72 @@ from simlingo_training.config import TrainConfig
 from simlingo_training.utils.logging_project import setup_logging
 # from simlingo_training.callbacks.visualise import VisualiseCallback
 
+
+def _resolve_repo_path(path_value):
+    if path_value is None:
+        return None
+
+    path = Path(str(path_value)).expanduser()
+    if not path.is_absolute():
+        path = (repo_root / path).resolve()
+    return path
+
+
+def _find_run_dir_from_checkpoint(checkpoint_path: Path) -> Path:
+    candidates = [
+        checkpoint_path,
+        checkpoint_path.parent,
+        checkpoint_path.parent.parent,
+    ]
+    for candidate in candidates:
+        if (candidate / ".hydra" / "config.yaml").exists():
+            return candidate
+    return checkpoint_path.parent.parent if checkpoint_path.is_file() else checkpoint_path
+
+
+def _copy_eval_overrides(src_cfg, dst_cfg, load_path):
+    with open_dict(dst_cfg):
+        dst_cfg.eval_mode = getattr(src_cfg, "eval_mode", "Dreaming")
+        dst_cfg.eval_load_path = str(load_path) if load_path is not None else None
+        dst_cfg.eval_batch_size = getattr(src_cfg, "eval_batch_size", 1)
+        dst_cfg.eval_num_workers = getattr(src_cfg, "eval_num_workers", 0)
+        dst_cfg.limit_predict_batches = getattr(src_cfg, "limit_predict_batches", None)
+        dst_cfg.gpus = getattr(src_cfg, "gpus", 1)
+        dst_cfg.precision = getattr(src_cfg, "precision", dst_cfg.precision)
+        dst_cfg.strategy = getattr(src_cfg, "strategy", dst_cfg.strategy)
+        dst_cfg.enable_wandb = getattr(src_cfg, "enable_wandb", False)
+        dst_cfg.checkpoint = None if load_path is not None else getattr(src_cfg, "checkpoint", None)
+
+    dst_cfg.data_module.qa_dataset = src_cfg.data_module.qa_dataset
+    dst_cfg.data_module.insteval_dataset = src_cfg.data_module.insteval_dataset
+    dst_cfg.data_module.batch_size = getattr(src_cfg, "eval_batch_size", 1)
+    dst_cfg.data_module.num_workers = getattr(src_cfg, "eval_num_workers", 0)
+
+    with open_dict(dst_cfg.data_module.base_dataset):
+        for key, value in src_cfg.data_module.base_dataset.items():
+            dst_cfg.data_module.base_dataset[key] = value
+
+    return dst_cfg
+
+
 @hydra.main(config_path=f"config", config_name="config", version_base="1.1")
 def main(cfg: TrainConfig):
-    
     torch.set_float32_matmul_precision("high")
-    pl.seed_everything(42)
-    
-    # eval_mode = "QA"
-    # eval_mode = "commentary"
-    eval_mode = "Dreaming"
+    pl.seed_everything(cfg.seed, workers=True)
 
-    qa_dataset = cfg.data_module.qa_dataset
-    insteval_dataset = cfg.data_module.insteval_dataset
-    load_path = '/YOUR_PATH/outputs/simlingo/checkpoints/epoch=013.ckpt'
+    requested_cfg = cfg
+    load_path = _resolve_repo_path(getattr(cfg, "eval_load_path", None))
     if load_path is not None:
-        load_path_config = Path(load_path).parent.parent / '.hydra/config.yaml'
-        cfg = OmegaConf.load(load_path_config)
-    
-    cfg.data_module.qa_dataset = qa_dataset
-    cfg.data_module.insteval_dataset = insteval_dataset
-    cfg.gpus = 1
-    cfg.data_module.num_workers = 8
-    cfg.data_module.batch_size = 64
+        if not load_path.exists():
+            raise FileNotFoundError(f"eval_load_path does not exist: {load_path}")
+
+        run_dir = _find_run_dir_from_checkpoint(load_path)
+        load_path_config = run_dir / ".hydra" / "config.yaml"
+        if load_path_config.exists():
+            cfg = OmegaConf.load(load_path_config)
+            cfg = _copy_eval_overrides(requested_cfg, cfg, load_path)
+
+    eval_mode = getattr(cfg, "eval_mode", "Dreaming")
 
     print(f'Eval mode: {eval_mode}')
     print(f'Checkpoint: {load_path}')
@@ -90,6 +138,8 @@ def main(cfg: TrainConfig):
 
     if cfg.checkpoint is not None:
         if os.path.isdir(cfg.checkpoint):
+            from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
+
             state_dict = get_fp32_state_dict_from_zero_checkpoint(cfg.checkpoint)
         else:
             state_dict = torch.load(cfg.checkpoint, map_location="cpu")
@@ -125,26 +175,35 @@ def main(cfg: TrainConfig):
     print(f"Number of GPUS: {cfg.gpus}")
     overfit = 0
     
-    if cfg.gpus >= 1:
-        trainer = Trainer(
-            accelerator="gpu",
-            benchmark=True,
-            devices=cfg.gpus,
-            gradient_clip_val=0.3,
-            log_every_n_steps=20,
-            logger=loggers,
-            precision=cfg.precision,
-            strategy=strategy,
-            sync_batchnorm=True,
-            max_epochs=cfg.max_epochs,
-            overfit_batches=overfit,
-            check_val_every_n_epoch=cfg.val_every_n_epochs,
-        )
+    trainer_kwargs = {
+        "benchmark": True,
+        "gradient_clip_val": 0.3,
+        "log_every_n_steps": cfg.log_every_n_steps,
+        "logger": loggers,
+        "precision": cfg.precision,
+        "max_epochs": cfg.max_epochs,
+        "overfit_batches": overfit,
+        "check_val_every_n_epoch": cfg.val_every_n_epochs,
+    }
+    if cfg.limit_predict_batches is not None:
+        trainer_kwargs["limit_predict_batches"] = cfg.limit_predict_batches
 
-    if load_path is not None:
-        trainer.predict(model, data_module, ckpt_path=f"{load_path}/")
+    if cfg.gpus >= 1:
+        trainer_kwargs.update({"accelerator": "gpu", "devices": cfg.gpus})
+        if strategy not in {None, "auto", "none"}:
+            trainer_kwargs["strategy"] = strategy
+            trainer_kwargs["sync_batchnorm"] = True
     else:
-        trainer.predict(model, data_module)
+        trainer_kwargs.update({"accelerator": "cpu", "devices": 1})
+
+    trainer = Trainer(**trainer_kwargs)
+
+    trainer.predict(
+        model,
+        data_module,
+        ckpt_path=str(load_path) if load_path is not None else None,
+        weights_only=False,
+    )
 
 if __name__ == "__main__":
     main()

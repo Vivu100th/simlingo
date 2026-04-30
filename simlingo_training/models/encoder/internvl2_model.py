@@ -2,11 +2,15 @@ import torch
 from torch import nn
 from typing import List, Optional
 from transformers import AutoModel
+from transformers.modeling_utils import PreTrainedModel
+
+if not hasattr(PreTrainedModel, "all_tied_weights_keys"):
+    PreTrainedModel.all_tied_weights_keys = {}
 
 class LingoInternVLModel(nn.Module):
     def __init__(self, variant, *args, **kwargs):
         super().__init__()
-        self.model = AutoModel.from_pretrained(variant, trust_remote_code=True)
+        self.model = AutoModel.from_pretrained(variant, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True)
         try:
             self.num_embeddings = self.model.language_model.model.embed_tokens.num_embeddings
         except:
@@ -47,13 +51,27 @@ class LingoInternVLModel(nn.Module):
             # for_inputs_embeds_ids = input_ids.clone()
             # for_inputs_embeds_ids[(input_ids >= self.num_embeddings)] = 0
             # inputs_embeds = language_model.model.get_input_embeddings()(for_inputs_embeds_ids)
-            inputs_embeds = adaptor_dict['language_inputs']
+            inputs_embeds = adaptor_dict['language_inputs'].clone()
             input_ids = adaptor_dict['language__ids']
             
             # 2a replace placeholder
-            smallest_added_id = self.tokenizer.additional_special_tokens_ids[0]
-            special_ids = torch.tensor(list(set(input_ids[(input_ids >= smallest_added_id)].tolist())), device=input_ids.device)
-            # special_ids = torch.tensor(list(set(ids[(ids > 50294)].tolist())), device=ids.device)
+            placeholder_token_ids = sorted(
+                {
+                    int(token_id)
+                    for placeholder_value in (placeholder_values or [])
+                    for token_id in placeholder_value.keys()
+                }
+            )
+            if placeholder_token_ids:
+                special_ids = torch.tensor(placeholder_token_ids, device=input_ids.device)
+            else:
+                additional_special_token_ids = getattr(self.tokenizer, "additional_special_tokens_ids", None)
+                if additional_special_token_ids is None:
+                    additional_tokens = getattr(self.tokenizer, "additional_special_tokens", [])
+                    additional_special_token_ids = self.tokenizer.convert_tokens_to_ids(additional_tokens)
+                    if isinstance(additional_special_token_ids, int):
+                        additional_special_token_ids = [additional_special_token_ids]
+                special_ids = torch.tensor(additional_special_token_ids or [], device=input_ids.device)
             special_ids = special_ids.view(-1, 1, 1)
             batch_size, seq_len = input_ids.shape
 
@@ -77,59 +95,79 @@ class LingoInternVLModel(nn.Module):
                 # get coords from label.placeholder_values with batch and special_id as key
                 special_token_pos = first_occurrences.nonzero()
 
-                coords = [torch.tensor(placeholder_values[b_id][special_ids[key_id].item()], device=input_ids.device, dtype=wp_encoder_dtype) for key_id, b_id in zip(special_token_pos[:, 1], special_token_pos[:, 0])]
-                coords_length_org = [len(coord) for coord in coords]
-                coords = torch.cat(coords)
-                wp_embeds = wp_encoder(coords.unsqueeze(0)).squeeze(0)
-                wp_embeds = torch.split(wp_embeds, coords_length_org)
+                if special_token_pos.numel() > 0:
+                    coords = [
+                        torch.tensor(
+                            placeholder_values[b_id][special_ids[key_id].item()],
+                            device=input_ids.device,
+                            dtype=wp_encoder_dtype,
+                        )
+                        for key_id, b_id in zip(special_token_pos[:, 1], special_token_pos[:, 0])
+                    ]
+                    coords_length_org = [len(coord) for coord in coords]
+                    coords = torch.cat(coords)
+                    wp_embeds = wp_encoder(coords.unsqueeze(0)).squeeze(0)
+                    wp_embeds = torch.split(wp_embeds, coords_length_org)
 
-                first_occurrences_filtered = [first_occurrences[i] for i in special_token_pos[:, 0]]
+                    first_occurrences_filtered = [first_occurrences[i] for i in special_token_pos[:, 0]]
 
-                for i, (pos, first_occurrence) in enumerate(zip(special_token_pos, first_occurrences_filtered)):
-                    start = first_occurrence[pos[1]]
-                    end = start + coords_length_org[i]
-                    inputs_embeds[pos[0], start:end] = wp_embeds[i]
+                    for i, (pos, first_occurrence) in enumerate(zip(special_token_pos, first_occurrences_filtered)):
+                        start = first_occurrence[pos[1]]
+                        end = start + coords_length_org[i]
+                        inputs_embeds[pos[0], start:end] = wp_embeds[i]
 
             # 2. Merge text and images
             if pixel_values is not None and input_ids.shape[1] != 1 and pixel_values.size(0) > 0:
-                all_pixel_values = [pixel_values]
+                has_image_context_tokens = (input_ids == self.img_context_token_id).any()
+                if not has_image_context_tokens:
+                    if not getattr(self, "_warned_missing_img_context_tokens", False):
+                        print(
+                            "warning: no <IMG_CONTEXT> tokens found; skipping image feature insertion "
+                            f"(id={self.img_context_token_id}, input_min={int(input_ids.min().item())}, "
+                            f"input_max={int(input_ids.max().item())}, seq_len={input_ids.shape[1]})"
+                        )
+                        self._warned_missing_img_context_tokens = True
+                else:
+                    all_pixel_values = [pixel_values]
                     
-                all_image_features = []
-                all_feature_lens = []
-                _, N_embed, C_embed = inputs_embeds.shape
+                    all_image_features = []
+                    _, N_embed, C_embed = inputs_embeds.shape
                 
-                for pixel_values_tmp in all_pixel_values:
-                    BS, T, NP, C, H, W = pixel_values_tmp.shape
-                    assert T == 1, "Only one frame is supported for now"
-                    # for multi-frame support, we need to change the code here
+                    for pixel_values_tmp in all_pixel_values:
+                        BS, T, NP, C, H, W = pixel_values_tmp.shape
+                        assert T == 1, "Only one frame is supported for now"
+                        # for multi-frame support, we need to change the code here
                     
-                    pixel_values_tmp = pixel_values_tmp.view(BS, NP, C, H, W)
+                        pixel_values_tmp = pixel_values_tmp.view(BS, NP, C, H, W)
 
-                    if pixel_values_tmp.dim() == 5:
-                        pixel_values_tmp = pixel_values_tmp.reshape(BS*NP, C, H, W)
-                    elif pixel_values_tmp.dim() != 4:
-                        # otherwise has to be stacked from list of (num_patches, num_channels, height, width)
-                        raise ValueError(f"pixel_values of shape {pixel_values_tmp.shape}, expect to be of 4 or 5 dimensions")
+                        if pixel_values_tmp.dim() == 5:
+                            pixel_values_tmp = pixel_values_tmp.reshape(BS*NP, C, H, W)
+                        elif pixel_values_tmp.dim() != 4:
+                            # otherwise has to be stacked from list of (num_patches, num_channels, height, width)
+                            raise ValueError(f"pixel_values of shape {pixel_values_tmp.shape}, expect to be of 4 or 5 dimensions")
+                        vision_param = next(self.model.vision_model.parameters())
+                        pixel_values_tmp = pixel_values_tmp.to(device=vision_param.device, dtype=vision_param.dtype)
                     
-                    image_features = self.model.extract_feature(pixel_values_tmp)
-                    image_features = image_features.reshape(-1, C_embed)
+                        image_features = self.model.extract_feature(pixel_values_tmp)
+                        image_features = image_features.reshape(-1, C_embed)
                                         
-                    all_image_features.append(image_features)
+                        all_image_features.append(image_features)
 
-                vit_embeds = torch.cat(all_image_features, dim=0)
-                inputs_embeds = inputs_embeds.reshape(BS * N_embed, C_embed)
-                input_ids = input_ids.reshape(BS * N_embed)
-                selected = (input_ids == self.img_context_token_id)
-                try:
-                    inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds.reshape(-1, C_embed)
-                except Exception as e:
-                    vit_embeds = vit_embeds.reshape(-1, C)
-                    print(f'warning: {e}, inputs_embeds[selected].shape={inputs_embeds[selected].shape}, '
-                        f'vit_embeds.shape={vit_embeds.shape}')
-                    n_token = selected.sum()
-                    inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds[:n_token]
-                inputs_embeds = inputs_embeds.reshape(BS, N_embed, C_embed)
-                input_ids = input_ids.reshape(BS, N_embed)
+                    vit_embeds = torch.cat(all_image_features, dim=0)
+                    vit_embeds = vit_embeds.to(dtype=inputs_embeds.dtype)
+                    inputs_embeds = inputs_embeds.reshape(BS * N_embed, C_embed)
+                    input_ids = input_ids.reshape(BS * N_embed)
+                    selected = (input_ids == self.img_context_token_id)
+                    try:
+                        inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds.reshape(-1, C_embed)
+                    except Exception as e:
+                        vit_embeds = vit_embeds.reshape(-1, C_embed)
+                        print(f'warning: {e}, inputs_embeds[selected].shape={inputs_embeds[selected].shape}, '
+                            f'vit_embeds.shape={vit_embeds.shape}')
+                        n_token = selected.sum()
+                        inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds[:n_token]
+                    inputs_embeds = inputs_embeds.reshape(BS, N_embed, C_embed)
+                    input_ids = input_ids.reshape(BS, N_embed)
             # pixel_values is not None but is empty ---> text only cases
             elif pixel_values is not None and input_ids.shape[1] != 1 and pixel_values.size(0) == 0:
                 # there are no images

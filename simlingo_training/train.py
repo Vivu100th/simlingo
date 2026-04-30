@@ -1,11 +1,17 @@
 import os
+import sys
+from pathlib import Path
+
+repo_root = Path(__file__).resolve().parents[1]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
 import hydra
 
 from omegaconf import OmegaConf
 import torch
 import wandb
 
-from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelSummary, ThroughputMonitor
@@ -51,6 +57,8 @@ def main(cfg: TrainConfig):
 
     if cfg.checkpoint is not None:
         if os.path.isdir(cfg.checkpoint):
+            from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
+
             state_dict = get_fp32_state_dict_from_zero_checkpoint(cfg.checkpoint)
         else:
             state_dict = torch.load(cfg.checkpoint, map_location="cpu")
@@ -89,15 +97,18 @@ def main(cfg: TrainConfig):
     # loggers.append(csvlogger)
     # csvlogger = None
 
-    wandblogger = WandbLogger(
-        project=cfg.wandb_project,
-        id=cfg.wandb_name,
-        name=cfg.wandb_name,
-        config=OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True),
-        resume=resume_wandb,
-    )
-    wandblogger.watch(model)
-    loggers.append(wandblogger)
+    if cfg.enable_wandb:
+        wandblogger = WandbLogger(
+            project=cfg.wandb_project,
+            id=cfg.wandb_name,
+            name=cfg.wandb_name,
+            config=OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True),
+            resume=resume_wandb,
+        )
+        wandblogger.watch(model)
+        loggers.append(wandblogger)
+    else:
+        loggers.append(CSVLogger("log", name=cfg.name))
 
     strategy = cfg.strategy
     if strategy == "deepspeed_stage_2":
@@ -105,54 +116,70 @@ def main(cfg: TrainConfig):
             stage=2, loss_scale=cfg.fp16_loss_scale, logging_batch_size_per_gpu=cfg.data_module.batch_size
         )
 
-    checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        save_top_k=-1,
-        monitor=None,
-        dirpath="./checkpoints",
-        filename="{epoch:03d}",
-        save_last=True,
-        every_n_epochs=cfg.val_every_n_epochs,
-        # every_n_train_steps=cfg.val_check_interval,
-    )
+    checkpoint_callback = None
+    if cfg.enable_checkpointing:
+        checkpoint_callback = pl.callbacks.ModelCheckpoint(
+            save_top_k=-1,
+            monitor=None,
+            dirpath="./checkpoints",
+            filename="{epoch:03d}",
+            save_last=True,
+            every_n_epochs=cfg.val_every_n_epochs,
+            # every_n_train_steps=cfg.val_check_interval,
+        )
 
     lr_monitor = LearningRateMonitor(logging_interval='step')
     model_summary = ModelSummary(max_depth=3)
     callbacks=[
-        checkpoint_callback, 
         model_summary, 
         # ThroughputMonitor(batch_size_fn=lambda batch: batch.driving_input.camera_images.size(0)), 
-        VisualiseCallback(interval=1000, val_interval=1000)
     ]
+    if cfg.enable_visualise_callback:
+        callbacks.append(VisualiseCallback(interval=1000, val_interval=1000))
+    if checkpoint_callback is not None:
+        callbacks.insert(0, checkpoint_callback)
     if not cfg.debug: 
         callbacks.append(lr_monitor)
     
     print(f"Number of GPUS: {cfg.gpus}")
     overfit = 0
     
+    trainer_kwargs = {
+        "benchmark": True,
+        "callbacks": callbacks,
+        "enable_checkpointing": cfg.enable_checkpointing,
+        "gradient_clip_val": 0.3,
+        "logger": loggers,
+        "precision": cfg.precision,
+        "max_epochs": cfg.max_epochs,
+        "overfit_batches": overfit,
+        "check_val_every_n_epoch": cfg.val_every_n_epochs,
+        "fast_dev_run": cfg.fast_dev_run,
+        "num_sanity_val_steps": cfg.num_sanity_val_steps,
+        "log_every_n_steps": cfg.log_every_n_steps,
+    }
+    if cfg.max_steps is not None:
+        trainer_kwargs["max_steps"] = cfg.max_steps
+    if cfg.limit_train_batches is not None:
+        trainer_kwargs["limit_train_batches"] = cfg.limit_train_batches
+    if cfg.limit_val_batches is not None:
+        trainer_kwargs["limit_val_batches"] = cfg.limit_val_batches
+    if cfg.val_check_interval is not None:
+        trainer_kwargs["val_check_interval"] = cfg.val_check_interval
+
     if cfg.gpus >= 1:
-        trainer = Trainer(
-            accelerator="gpu",
-            benchmark=True,
-            callbacks=callbacks,
-            devices=cfg.gpus,
-            # enable_checkpointing=False,
-            gradient_clip_val=0.3,
-            # gradient_clip_algorithm="value",
-            # log_every_n_steps=10,
-            logger=loggers,
-            # max_steps=cfg.max_steps,
-            precision=cfg.precision,
-            strategy=strategy,
-            sync_batchnorm=True,
-            # use_distributed_sampler=False,
-            max_epochs=cfg.max_epochs,
-            overfit_batches=overfit,
-            check_val_every_n_epoch=cfg.val_every_n_epochs,
-            # val_check_interval=cfg.val_check_interval,
-        )
+        trainer_kwargs.update({"accelerator": "gpu", "devices": cfg.gpus})
+        if strategy not in {None, "auto", "none"}:
+            trainer_kwargs["strategy"] = strategy
+            trainer_kwargs["sync_batchnorm"] = True
+    else:
+        trainer_kwargs.update({"accelerator": "cpu", "devices": 1})
+
+    trainer = Trainer(**trainer_kwargs)
 
     trainer.fit(model, data_module, ckpt_path=resume_path)
-    wandb.finish()
+    if cfg.enable_wandb:
+        wandb.finish()
 
 if __name__ == "__main__":
     main()
