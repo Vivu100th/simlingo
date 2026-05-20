@@ -1,5 +1,6 @@
-export CARLA_ROOT=/home/vivu/software/carla0915
-export WORK_DIR=/home/vivu/Desktop/simlingo
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export CARLA_ROOT="${CARLA_ROOT:-/home/vivu/software/carla0915}"
+export WORK_DIR="${WORK_DIR:-${SCRIPT_DIR}}"
 export PYTHONPATH=$PYTHONPATH:${WORK_DIR}
 export PYTHONPATH=$PYTHONPATH:${CARLA_ROOT}/PythonAPI
 export PYTHONPATH=$PYTHONPATH:${CARLA_ROOT}/PythonAPI/carla

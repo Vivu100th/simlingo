@@ -5,6 +5,8 @@ Usage:
   python run_benchmark_local.py
 
 Optional environment overrides:
+  CARLA_ROOT=/path/to/carla0915
+  SIMLINGO_CODE_ROOT=/path/to/simlingo
   SIMLINGO_BENCHMARK_ROUTES=leaderboard/data/bench2drive_split/bench2drive_07.xml
   SIMLINGO_BENCHMARK_CHECKPOINT=outputs/.../checkpoints/epoch=029_fp32/pytorch_model.bin
   SIMLINGO_BENCHMARK_RESULT=outputs/benchmark_base_results.json
@@ -27,8 +29,12 @@ import atexit
 # CONFIGURATION
 # ============================================================================
 
-CODE_ROOT = r"/home/vivu/Desktop/simlingo"
-CARLA_ROOT = "/home/vivu/software/carla0915"
+CODE_ROOT = (
+    os.environ.get("SIMLINGO_CODE_ROOT")
+    or os.environ.get("CODE_ROOT")
+    or os.path.dirname(os.path.abspath(__file__))
+)
+CARLA_ROOT = os.environ.get("CARLA_ROOT", "/home/vivu/software/carla0915")
 
 # The route file to evaluate on. The default is a single Bench2Drive ParkingExit
 # route so a local CARLA integration check can finish on one GPU.

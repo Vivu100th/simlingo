@@ -33,14 +33,18 @@ import re
 
 
 # ============================================================================
-# CONFIGURATION - Edit these before running!
+# CONFIGURATION - Prefer environment variables instead of editing this file.
 # ============================================================================
 
 # Path to the simlingo code directory
-CODE_ROOT = r"/home/vivu/Desktop/simlingo"
+CODE_ROOT = (
+    os.environ.get("SIMLINGO_CODE_ROOT")
+    or os.environ.get("CODE_ROOT")
+    or str(Path(__file__).resolve().parent)
+)
 
 # Path to CARLA installation root
-CARLA_ROOT = "/home/vivu/software/carla0915"
+CARLA_ROOT = os.environ.get("CARLA_ROOT", "/home/vivu/software/carla0915")
 
 # Dataset naming
 # Default to a stable merged dataset so multiple collection days are easy to train together.
