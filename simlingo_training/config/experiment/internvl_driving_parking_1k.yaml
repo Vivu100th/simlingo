@@ -1,0 +1,13 @@
+# @package _global_
+defaults:
+  - internvl_driving_1k
+
+checkpoint: simlingo_training/outputs/2026_04_28_23_35_11_simlingo_internvl_driving_clean_1k/checkpoints/last.ckpt
+
+data_module:
+  base_dataset:
+    data_path: database/simlingo_v2_all_plus_parking
+
+max_steps: 1000
+val_check_interval: 200
+name: simlingo_internvl_driving_parking_1k

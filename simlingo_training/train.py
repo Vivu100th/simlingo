@@ -56,12 +56,20 @@ def main(cfg: TrainConfig):
         )
 
     if cfg.checkpoint is not None:
-        if os.path.isdir(cfg.checkpoint):
+        checkpoint_path = Path(cfg.checkpoint)
+        if not checkpoint_path.is_absolute():
+            repo_checkpoint_path = repo_root / checkpoint_path
+            if repo_checkpoint_path.exists():
+                checkpoint_path = repo_checkpoint_path
+
+        if os.path.isdir(checkpoint_path):
             from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
 
-            state_dict = get_fp32_state_dict_from_zero_checkpoint(cfg.checkpoint)
+            state_dict = get_fp32_state_dict_from_zero_checkpoint(str(checkpoint_path))
         else:
-            state_dict = torch.load(cfg.checkpoint, map_location="cpu")
+            checkpoint = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+            state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        print(f"Loading model weights from {checkpoint_path}")
         model.load_state_dict(state_dict)
 
         

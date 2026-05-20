@@ -1,7 +1,0 @@
-# @package _global_
-defaults:
-  - mtid_1k
-
-max_steps: -1
-max_epochs: 10
-name: simlingo_mtid_10e

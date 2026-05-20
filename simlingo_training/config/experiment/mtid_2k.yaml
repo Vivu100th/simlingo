@@ -1,6 +1,0 @@
-# @package _global_
-defaults:
-  - mtid_1k
-
-max_steps: 2000
-name: simlingo_mtid_2k

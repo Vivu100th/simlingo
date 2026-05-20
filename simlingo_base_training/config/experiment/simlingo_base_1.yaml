@@ -34,6 +34,7 @@ data_module:
 max_epochs: 30
 seed: 42
 gpus: 1
+strategy: auto
 val_every_n_epochs: 2
 name: simlingo_base_seed_42
 

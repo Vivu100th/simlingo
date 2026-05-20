@@ -36,7 +36,8 @@ import scenario_logger
 import transfuser_utils as t_u
 from agents.navigation.local_planner import RoadOption
 from scenario_logger import ScenarioLogger
-from simlingo_training.utils.custom_types import DrivingInput
+from simlingo_base_training.utils.custom_types import DrivingInput as BaseDrivingInput
+from simlingo_training.utils.custom_types import DrivingInput as LingoDrivingInput
 from simlingo_training.utils.custom_types import LanguageLabel
 from simlingo_training.utils.internvl2_utils import build_transform, dynamic_preprocess
 from config_simlingo import GlobalConfig
@@ -65,8 +66,8 @@ def get_entry_point():
     return 'LingoAgent'
 
 
-DEBUG = False # saves images during evaluation
-HD_VIZ = False
+DEBUG = bool(int(os.environ.get("SIMLINGO_CARLA_AGENT_VIZ", "0"))) # saves/displays images during evaluation
+HD_VIZ = bool(int(os.environ.get("SIMLINGO_CARLA_AGENT_HD_VIZ", "0")))
 USE_UKF = True
 
 class LingoAgent(autonomous_agent.AutonomousAgent):
@@ -170,12 +171,14 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         self.cfg.model.vision_model.use_global_img = cfg.data_module.get("use_global_img", False)
     
         processor = AutoProcessor.from_pretrained(cfg.model.vision_model.variant, trust_remote_code=True)
-        if 'tokenizer' in processor.__dict__:
-                self.tokenizer = processor.tokenizer
-        else:
+        self.tokenizer = getattr(processor, "tokenizer", None)
+        if self.tokenizer is None and hasattr(processor, "add_special_tokens"):
                 self.tokenizer = processor
-        self.tokenizer.add_special_tokens({'additional_special_tokens': ['<WAYPOINTS>','<WAYPOINTS_DIFF>', '<ORG_WAYPOINTS_DIFF>', '<ORG_WAYPOINTS>', '<WAYPOINT_LAST>', '<ROUTE>', '<ROUTE_DIFF>', '<TARGET_POINT>']})
-        self.tokenizer.padding_side = "left"
+        if self.tokenizer is not None:
+                self.tokenizer.add_special_tokens({'additional_special_tokens': ['<WAYPOINTS>','<WAYPOINTS_DIFF>', '<ORG_WAYPOINTS_DIFF>', '<ORG_WAYPOINTS>', '<WAYPOINT_LAST>', '<ROUTE>', '<ROUTE_DIFF>', '<TARGET_POINT>']})
+                self.tokenizer.padding_side = "left"
+        else:
+                print("No tokenizer found for image-only processor; running direct driving mode.", flush=True)
         # llm_tokenizer = AutoTokenizer.from_pretrained(cfg.model.language_model.variant)
         cache_dir = f"pretrained/{(cfg.model.vision_model.variant.split('/')[1])}"
         self.model_dtype = torch.float16 if 'resnet' in self.cfg.model.vision_model.variant.lower() else torch.bfloat16
@@ -185,14 +188,26 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         use_global_img = cfg.data_module.get("use_global_img", cfg.data_module.get("base_dataset", {}).get("use_global_img", False))
         route_as = self.route_as
         
-        self.model = hydra.utils.instantiate(
-                cfg.model,
-                cfg_data_module=cfg.data_module,
-                processor=processor,
-                cache_dir=cache_dir,
-                route_as=route_as, 
-                _recursive_=False
-            )
+        model_target = str(cfg.model.get("_target_", ""))
+        self.is_base_training_model = model_target.startswith("simlingo_base_training.")
+        self.driving_input_type = BaseDrivingInput if self.is_base_training_model else LingoDrivingInput
+        if self.is_base_training_model:
+            self.model = hydra.utils.instantiate(
+                    cfg.model,
+                    route_as=route_as,
+                    vision_model={
+                        "use_global_img": use_global_img,
+                    },
+                )
+        else:
+            self.model = hydra.utils.instantiate(
+                    cfg.model,
+                    cfg_data_module=cfg.data_module,
+                    processor=processor,
+                    cache_dir=cache_dir,
+                    route_as=route_as, 
+                    _recursive_=False
+                )
         import gc; gc.collect(); torch.cuda.empty_cache()
         self.model = self.model.to(self.device)
         torch.set_default_dtype(default_dtype)
@@ -222,6 +237,10 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         self.min_desired_speed = max(0.0, float(os.environ.get("SIMLINGO_CARLA_MIN_DESIRED_SPEED", "0.0")))
         self.max_desired_speed = max(0.0, float(os.environ.get("SIMLINGO_CARLA_MAX_DESIRED_SPEED", "0.0")))
         self.parking_exit_route_fix = bool(int(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_ROUTE_FIX", "0")))
+        self.parking_exit_policy = bool(int(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_POLICY", "0")))
+        self.parking_exit_centerline_route = bool(
+            int(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_CENTERLINE_ROUTE", "1"))
+        )
         self.parking_exit_yield = bool(int(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_YIELD", "0")))
         self.parking_exit_yield_steps = max(0, int(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_YIELD_STEPS", "420")))
         self.parking_exit_yield_brake_steps = max(
@@ -240,6 +259,12 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         self.parking_exit_yield_distance = max(
             0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_YIELD_DISTANCE", "25.0"))
         )
+        self.parking_exit_moving_brake_distance = max(
+            0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_MOVING_BRAKE_DISTANCE", "5.0"))
+        )
+        self.parking_exit_driving_side_clear_lateral = max(
+            0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_DRIVING_SIDE_CLEAR_LATERAL", "2.8"))
+        )
         self.parking_exit_creep_throttle = max(
             0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_CREEP_THROTTLE", "0.25"))
         )
@@ -254,13 +279,46 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
             0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_NUDGE_STATIC_SPEED", "0.2"))
         )
         self.parking_exit_nudge_static_distance = max(
-            0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_NUDGE_STATIC_DISTANCE", "7.0"))
+            0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_NUDGE_STATIC_DISTANCE", "10.0"))
         )
         self.parking_exit_nudge_static_lateral = max(
-            0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_NUDGE_STATIC_LATERAL", "1.2"))
+            0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_NUDGE_STATIC_LATERAL", "2.0"))
+        )
+        self.parking_exit_static_brake_distance = max(
+            0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_STATIC_BRAKE_DISTANCE", "3.0"))
+        )
+        self.parking_exit_avoid_steer = min(
+            1.0,
+            max(0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_AVOID_STEER", "0.45"))),
+        )
+        self.parking_exit_avoid_throttle = max(
+            0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_AVOID_THROTTLE", "0.18"))
+        )
+        self.parking_exit_recenter_steps = max(
+            self.parking_exit_yield_steps,
+            int(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_RECENTER_STEPS", "2600")),
+        )
+        self.parking_exit_recenter_speed = max(
+            0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_RECENTER_SPEED", "1.5"))
+        )
+        self.parking_exit_recenter_throttle = max(
+            0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_RECENTER_THROTTLE", "0.35"))
+        )
+        self.parking_exit_recenter_lane_distance = max(
+            0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_RECENTER_LANE_DISTANCE", "2.2"))
+        )
+        self.parking_exit_rear_longitudinal = max(
+            0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_REAR_LONGITUDINAL", "18.0"))
+        )
+        self.parking_exit_rear_throttle = max(
+            0.0, float(os.environ.get("SIMLINGO_CARLA_PARKING_EXIT_REAR_THROTTLE", "0.60"))
         )
         self._parking_exit_route_fix_active = False
         self._parking_exit_merge_side = 0
+        self._parking_exit_target_road_id = None
+        self._parking_exit_target_lane_id = None
+        self._parking_exit_coordinate_offset = None
+        self._last_parking_exit_centerline_debug = "off"
         self._last_parking_exit_yield_debug = "off"
         self._debug_collision_sensor = None
         self._debug_collision_events = []
@@ -275,8 +333,11 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
             f"min_desired_speed={self.min_desired_speed:.3f} "
             f"max_desired_speed={self.max_desired_speed:.3f} "
             f"parking_exit_route_fix={int(self.parking_exit_route_fix)} "
+            f"parking_exit_policy={int(self.parking_exit_policy)} "
+            f"parking_exit_centerline_route={int(self.parking_exit_centerline_route)} "
             f"parking_exit_yield={int(self.parking_exit_yield)} "
             f"parking_exit_merge_steer={self.parking_exit_merge_steer:.3f} "
+            f"parking_exit_recenter_steps={self.parking_exit_recenter_steps} "
             f"parking_exit_nudge_static={int(self.parking_exit_nudge_static)} "
             f"debug_waypoint_hazard={int(self.debug_waypoint_hazard)}",
             flush=True,
@@ -417,6 +478,20 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
                     merge_command = RoadOption.CHANGELANELEFT if lateral_offset > 0.0 else RoadOption.CHANGELANERIGHT
                     self._parking_exit_route_fix_active = True
                     self._parking_exit_merge_side = -1 if merge_command == RoadOption.CHANGELANELEFT else 1
+                    if CarlaDataProvider is not None:
+                        try:
+                            world_map = CarlaDataProvider.get_map()
+                            target_waypoint = world_map.get_waypoint(
+                                first_transform.location,
+                                project_to_road=True,
+                                lane_type=carla.LaneType.Any,
+                            )
+                            if target_waypoint is not None:
+                                self._parking_exit_target_road_id = int(target_waypoint.road_id)
+                                self._parking_exit_target_lane_id = int(target_waypoint.lane_id)
+                        except Exception:
+                            self._parking_exit_target_road_id = None
+                            self._parking_exit_target_lane_id = None
 
                     converter = RoutePlanner(route_min_distance, self.route_planner_max_distance,
                                              self.lat_ref, self.lon_ref)
@@ -430,6 +505,7 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
                         first_transform.location.z,
                     ])
                     coordinate_offset = first_converted - first_world
+                    self._parking_exit_coordinate_offset = coordinate_offset
 
                     def shifted_transform(transform):
                         location = transform.location
@@ -458,6 +534,8 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
                         f"lateral_offset={lateral_offset:.3f} "
                         f"merge_command={merge_command.name} "
                         f"route_min_distance={route_min_distance:.3f} "
+                        f"target_lane={self._parking_exit_target_road_id}/"
+                        f"{self._parking_exit_target_lane_id} "
                         f"coordinate_offset=({coordinate_offset[0]:.3f},"
                         f"{coordinate_offset[1]:.3f},{coordinate_offset[2]:.3f}) "
                         f"{geometry_debug}",
@@ -634,10 +712,10 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
             )
         return debug
 
-    def _find_parking_exit_hazard(self, include_same_lane=False):
-        if not (self.parking_exit_yield and self._parking_exit_route_fix_active):
+    def _find_parking_exit_hazard(self, include_same_lane=False, ignore_step_limit=False):
+        if not self._parking_exit_route_fix_active:
             return None
-        if self.step > self.parking_exit_yield_steps:
+        if self.step > self.parking_exit_yield_steps and not ignore_step_limit:
             return None
 
         vehicle = getattr(self, "_vehicle", None) or getattr(self, "hero_actor", None)
@@ -676,6 +754,40 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
             if distance > self.parking_exit_yield_distance:
                 continue
 
+            actor_road_id = "none"
+            actor_lane_id = "none"
+            actor_lane_type = "none"
+            if world_map is not None:
+                try:
+                    actor_waypoint = world_map.get_waypoint(
+                        actor_location,
+                        project_to_road=True,
+                        lane_type=carla.LaneType.Any,
+                    )
+                    if actor_waypoint is not None:
+                        actor_road_id = int(actor_waypoint.road_id)
+                        actor_lane_id = int(actor_waypoint.lane_id)
+                        actor_lane_type = str(actor_waypoint.lane_type).replace(" ", "_")
+                except Exception:
+                    actor_lane_type = "lane_debug_error"
+
+            target_lane_id = getattr(self, "_parking_exit_target_lane_id", None)
+            target_road_id = getattr(self, "_parking_exit_target_road_id", None)
+            in_target_lane = (
+                include_same_lane
+                and target_lane_id is not None
+                and actor_lane_id != "none"
+                and int(actor_lane_id) == int(target_lane_id)
+                and (
+                    target_road_id is None
+                    or (actor_road_id != "none" and int(actor_road_id) == int(target_road_id))
+                )
+                and "Driving" in str(actor_lane_type)
+                and -self.parking_exit_rear_longitudinal
+                <= longitudinal
+                <= min(self.parking_exit_yield_longitudinal, 14.0)
+            )
+
             in_merge_side = (
                 self.parking_exit_yield_lateral_min
                 <= target_side_lateral
@@ -689,9 +801,11 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
             in_same_lane = (
                 include_same_lane
                 and abs(lateral) <= 2.2
-                and -4.0 <= longitudinal <= min(self.parking_exit_yield_longitudinal, 12.0)
+                and -self.parking_exit_rear_longitudinal
+                <= longitudinal
+                <= min(self.parking_exit_yield_longitudinal, 12.0)
             )
-            if not ((in_merge_side and in_longitudinal_window) or in_same_lane):
+            if not ((in_merge_side and in_longitudinal_window) or in_same_lane or in_target_lane):
                 continue
 
             candidate = {
@@ -701,23 +815,11 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
                 "longitudinal": float(longitudinal),
                 "lateral": float(lateral),
                 "speed": float(actor_speed),
-                "road_id": "none",
-                "lane_id": "none",
-                "lane_type": "none",
+                "road_id": actor_road_id,
+                "lane_id": actor_lane_id,
+                "lane_type": actor_lane_type,
+                "in_target_lane": bool(in_target_lane),
             }
-            if world_map is not None:
-                try:
-                    actor_waypoint = world_map.get_waypoint(
-                        actor_location,
-                        project_to_road=True,
-                        lane_type=carla.LaneType.Any,
-                    )
-                    if actor_waypoint is not None:
-                        candidate["road_id"] = int(actor_waypoint.road_id)
-                        candidate["lane_id"] = int(actor_waypoint.lane_id)
-                        candidate["lane_type"] = str(actor_waypoint.lane_type).replace(" ", "_")
-                except Exception:
-                    candidate["lane_type"] = "lane_debug_error"
             if best_hazard is None or candidate["distance"] < best_hazard["distance"]:
                 best_hazard = candidate
 
@@ -804,50 +906,354 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
             )
         return " ".join(parts) + " "
 
+    def _control_scalar(self, value, default=0.0):
+        try:
+            return float(np.asarray(value).reshape(-1)[0])
+        except Exception:
+            return float(default)
+
+    def _parking_exit_forward_throttle(self, throttle, floor=None, ceiling=None):
+        floor_value = self.parking_exit_creep_throttle if floor is None else floor
+        throttle_value = max(self._control_scalar(throttle), float(floor_value))
+        if ceiling is not None:
+            throttle_value = min(throttle_value, float(ceiling))
+        return throttle_value
+
+    def _parking_exit_hazard_debug(self, hazard):
+        if hazard is None:
+            return "none"
+        return (
+            f"id{hazard['id']}:{hazard['type']}:"
+            f"d{hazard['distance']:.2f}:x{hazard['longitudinal']:.2f}:"
+            f"y{hazard['lateral']:.2f}:v{hazard['speed']:.2f}:"
+            f"road{hazard['road_id']}:lane{hazard['lane_id']}:{hazard['lane_type']}"
+        )
+
+    def _parking_exit_world_to_route_xy(self, location):
+        coordinate_offset = getattr(self, "_parking_exit_coordinate_offset", None)
+        if coordinate_offset is None:
+            coordinate_offset = np.zeros(3, dtype=np.float32)
+        return np.array(
+            [
+                float(location.x + coordinate_offset[0]),
+                float(location.y + coordinate_offset[1]),
+            ],
+            dtype=np.float32,
+        )
+
+    def _parking_exit_target_lane_waypoint(self, source_waypoint):
+        target_lane_id = getattr(self, "_parking_exit_target_lane_id", None)
+        target_road_id = getattr(self, "_parking_exit_target_road_id", None)
+        if source_waypoint is None or target_lane_id is None:
+            return None
+
+        def is_target_lane(waypoint):
+            if waypoint is None:
+                return False
+            if int(waypoint.lane_id) != int(target_lane_id):
+                return False
+            if target_road_id is not None and int(waypoint.road_id) != int(target_road_id):
+                return False
+            return "Driving" in str(waypoint.lane_type)
+
+        if is_target_lane(source_waypoint):
+            return source_waypoint
+
+        frontier = [source_waypoint]
+        visited = {(int(source_waypoint.road_id), int(source_waypoint.lane_id))}
+        for _ in range(4):
+            next_frontier = []
+            for waypoint in frontier:
+                neighbors = []
+                for getter_name in ("get_left_lane", "get_right_lane"):
+                    try:
+                        neighbors.append(getattr(waypoint, getter_name)())
+                    except Exception:
+                        neighbors.append(None)
+                for neighbor_waypoint in neighbors:
+                    if neighbor_waypoint is None:
+                        continue
+                    key = (int(neighbor_waypoint.road_id), int(neighbor_waypoint.lane_id))
+                    if key in visited:
+                        continue
+                    if is_target_lane(neighbor_waypoint):
+                        return neighbor_waypoint
+                    visited.add(key)
+                    next_frontier.append(neighbor_waypoint)
+            frontier = next_frontier
+        return None
+
+    def _build_parking_exit_centerline_route(self, gps_xy, compass, reference_route):
+        self._last_parking_exit_centerline_debug = "off"
+        if not (
+            self.parking_exit_policy
+            and self.parking_exit_centerline_route
+            and self._parking_exit_route_fix_active
+        ):
+            return None
+        if self.step > self.parking_exit_recenter_steps:
+            self._last_parking_exit_centerline_debug = "expired"
+            return None
+
+        vehicle = getattr(self, "_vehicle", None) or getattr(self, "hero_actor", None)
+        world_map = getattr(self, "world_map", None)
+        if vehicle is None or world_map is None:
+            self._last_parking_exit_centerline_debug = "no_handles"
+            return None
+
+        try:
+            vehicle_transform = vehicle.get_transform()
+            source_waypoint = world_map.get_waypoint(
+                vehicle_transform.location,
+                project_to_road=True,
+                lane_type=carla.LaneType.Any,
+            )
+        except Exception as exc:
+            self._last_parking_exit_centerline_debug = f"waypoint_error:{type(exc).__name__}"
+            return None
+
+        target_waypoint = self._parking_exit_target_lane_waypoint(source_waypoint)
+        if target_waypoint is None:
+            lane_id = getattr(source_waypoint, "lane_id", "none")
+            self._last_parking_exit_centerline_debug = f"no_target_lane:{lane_id}"
+            return None
+
+        try:
+            if reference_route is not None and hasattr(reference_route, "shape") and len(reference_route.shape) >= 2:
+                route_count = int(reference_route.shape[1])
+            else:
+                route_count = 8
+        except Exception:
+            route_count = 8
+        route_count = max(4, min(route_count, 10))
+
+        points_local = []
+        for distance in np.linspace(2.0, 2.0 * route_count, route_count):
+            try:
+                candidates = target_waypoint.next(float(distance))
+                next_waypoint = candidates[0] if candidates else target_waypoint
+            except Exception:
+                next_waypoint = target_waypoint
+            route_xy = self._parking_exit_world_to_route_xy(next_waypoint.transform.location)
+            try:
+                local_xy = t_u.inverse_conversion_2d(route_xy, np.asarray(gps_xy)[:2], float(compass))
+            except Exception as exc:
+                self._last_parking_exit_centerline_debug = f"convert_error:{type(exc).__name__}"
+                return None
+            points_local.append(local_xy.astype(np.float32))
+
+        route_np = np.asarray(points_local, dtype=np.float32)
+        if route_np.size == 0 or not np.isfinite(route_np).all():
+            self._last_parking_exit_centerline_debug = "invalid_route"
+            return None
+
+        first_point = route_np[0]
+        self._last_parking_exit_centerline_debug = (
+            f"active:{int(target_waypoint.road_id)}/{int(target_waypoint.lane_id)}:"
+            f"{str(target_waypoint.lane_type).replace(' ', '_')}:"
+            f"p0={first_point[0]:.2f},{first_point[1]:.2f}"
+        )
+        device = reference_route.device if hasattr(reference_route, "device") else self.device
+        dtype = reference_route.dtype if hasattr(reference_route, "dtype") else torch.float32
+        return torch.from_numpy(route_np).to(device=device, dtype=dtype).unsqueeze(0)
+
     def _apply_parking_exit_yield_guard(self, steer, throttle, brake, world_debug):
         self._last_parking_exit_yield_debug = "off"
-        if not (self.parking_exit_yield and self._parking_exit_route_fix_active):
-            return steer, throttle, brake, False
-        if self.step > self.parking_exit_yield_steps:
-            self._last_parking_exit_yield_debug = "expired"
+        parking_exit_enabled = (
+            self._parking_exit_route_fix_active
+            and (self.parking_exit_yield or self.parking_exit_policy)
+        )
+        if not parking_exit_enabled:
             return steer, throttle, brake, False
 
         lane_type = str(world_debug.get("lane_type", ""))
+        in_parking_lane = "Parking" in lane_type
         in_driving_lane = "Driving" in lane_type
-        hazard = self._find_parking_exit_hazard(include_same_lane=in_driving_lane)
+        recenter_window = self.parking_exit_policy and self.step <= self.parking_exit_recenter_steps
+        if self.step > self.parking_exit_yield_steps and not in_parking_lane and not recenter_window:
+            self._last_parking_exit_yield_debug = "expired"
+            return steer, throttle, brake, False
+
+        world_speed = abs(self._control_scalar(world_debug.get("world_speed"), default=float("inf")))
+        lane_dist = self._control_scalar(world_debug.get("lane_dist"), default=float("inf"))
+        hazard = self._find_parking_exit_hazard(
+            include_same_lane=in_driving_lane,
+            ignore_step_limit=recenter_window,
+        )
+        hazard_debug = self._parking_exit_hazard_debug(hazard)
         if hazard is not None:
-            hazard_debug = (
-                f"id{hazard['id']}:{hazard['type']}:"
-                f"d{hazard['distance']:.2f}:x{hazard['longitudinal']:.2f}:"
-                f"y{hazard['lateral']:.2f}:v{hazard['speed']:.2f}:"
-                f"road{hazard['road_id']}:lane{hazard['lane_id']}:{hazard['lane_type']}"
+            hazard_static = hazard["speed"] <= self.parking_exit_nudge_static_speed
+            hazard_target_lane = bool(hazard.get("in_target_lane", False))
+            hazard_same_lane = (
+                abs(hazard["lateral"]) <= self.parking_exit_nudge_static_lateral
+                and -1.5 <= hazard["longitudinal"] <= self.parking_exit_nudge_static_distance
             )
-            static_nudge = (
-                self.parking_exit_nudge_static
-                and in_driving_lane
-                and hazard["speed"] <= self.parking_exit_nudge_static_speed
+            if not hazard_static:
+                side_lane_clear = (
+                    recenter_window
+                    and in_driving_lane
+                    and not hazard_target_lane
+                    and abs(hazard["lateral"]) >= self.parking_exit_driving_side_clear_lateral
+                )
+                if side_lane_clear:
+                    if world_speed <= self.parking_exit_recenter_speed and lane_dist <= self.parking_exit_recenter_lane_distance:
+                        throttle_value = self._parking_exit_forward_throttle(
+                            throttle,
+                            floor=self.parking_exit_recenter_throttle,
+                        )
+                        self._last_parking_exit_yield_debug = f"side_clear_recenter:{hazard_debug}"
+                        return steer, throttle_value, False, True
+                    self._last_parking_exit_yield_debug = f"side_clear:{hazard_debug}"
+                    return steer, throttle, brake, False
+                if (
+                    recenter_window
+                    and in_driving_lane
+                    and hazard["longitudinal"] < -1.0
+                    and hazard["speed"] > world_speed + 0.5
+                ):
+                    throttle_value = self._parking_exit_forward_throttle(
+                        throttle,
+                        floor=self.parking_exit_rear_throttle,
+                    )
+                    self._last_parking_exit_yield_debug = f"rear_clear:{hazard_debug}"
+                    return steer, throttle_value, False, True
+                moving_hazard_immediate = (
+                    hazard["distance"] <= self.parking_exit_moving_brake_distance
+                    or -3.0 <= hazard["longitudinal"] <= 4.0
+                )
+                if self.step <= self.parking_exit_yield_brake_steps or moving_hazard_immediate:
+                    self._last_parking_exit_yield_debug = f"yield_moving:{hazard_debug}"
+                    return steer, 0.0, True, True
+                if in_parking_lane:
+                    merge_steer = self._parking_exit_merge_side * self.parking_exit_merge_steer
+                    throttle_value = self._parking_exit_forward_throttle(throttle)
+                    self._last_parking_exit_yield_debug = f"merge_after_yield:{hazard_debug}"
+                    return merge_steer, throttle_value, False, True
+
+            static_target_blocker = (
+                self.parking_exit_policy
+                and in_parking_lane
+                and hazard_static
+                and hazard_target_lane
                 and hazard["distance"] <= self.parking_exit_nudge_static_distance
-                and abs(hazard["lateral"]) <= self.parking_exit_nudge_static_lateral
+            )
+            if static_target_blocker:
+                if hazard["distance"] <= max(6.0, self.parking_exit_static_brake_distance):
+                    self._last_parking_exit_yield_debug = f"static_target_brake:{hazard_debug}"
+                    return steer, 0.0, True, True
+                if hazard["longitudinal"] > 2.0:
+                    self._last_parking_exit_yield_debug = f"yield_static_target:{hazard_debug}"
+                    return steer, 0.0, True, True
+                if hazard["distance"] <= max(1.8, self.parking_exit_static_brake_distance * 0.6):
+                    self._last_parking_exit_yield_debug = f"static_target_brake:{hazard_debug}"
+                    return steer, 0.0, True, True
+
+                avoid_steer = -self._parking_exit_merge_side * min(0.35, self.parking_exit_avoid_steer)
+                throttle_value = self._parking_exit_forward_throttle(
+                    throttle,
+                    floor=max(0.10, self.parking_exit_avoid_throttle * 0.6),
+                    ceiling=self.parking_exit_avoid_throttle,
+                )
+                self._last_parking_exit_yield_debug = f"static_target_pass:{hazard_debug}"
+                return avoid_steer, throttle_value, False, True
+
+            static_nudge = (
+                (self.parking_exit_policy or self.parking_exit_nudge_static)
+                and in_driving_lane
+                and hazard_static
+                and hazard_same_lane
+                and hazard["distance"] <= self.parking_exit_nudge_static_distance
             )
             if static_nudge:
-                merge_steer = self._parking_exit_merge_side * self.parking_exit_merge_steer
-                throttle_value = min(float(np.asarray(throttle).reshape(-1)[0]), self.parking_exit_creep_throttle)
-                self._last_parking_exit_yield_debug = f"static_nudge:{hazard_debug}"
-                return merge_steer, throttle_value, False, True
-            if self.step <= self.parking_exit_yield_brake_steps or in_driving_lane:
-                self._last_parking_exit_yield_debug = f"yield:{hazard_debug}"
+                if hazard_target_lane and hazard["distance"] <= max(6.0, self.parking_exit_static_brake_distance):
+                    self._last_parking_exit_yield_debug = f"static_target_brake:{hazard_debug}"
+                    return steer, 0.0, True, True
+                if hazard["distance"] <= self.parking_exit_static_brake_distance:
+                    self._last_parking_exit_yield_debug = f"static_brake:{hazard_debug}"
+                    return steer, 0.0, True, True
+                if hazard_target_lane and abs(hazard["lateral"]) > 1.0:
+                    throttle_value = self._parking_exit_forward_throttle(
+                        throttle,
+                        floor=max(0.10, self.parking_exit_avoid_throttle * 0.6),
+                        ceiling=self.parking_exit_avoid_throttle,
+                    )
+                    self._last_parking_exit_yield_debug = f"static_target_centerline:{hazard_debug}"
+                    return steer, throttle_value, False, True
+
+                if abs(hazard["lateral"]) < 0.3 and self._parking_exit_merge_side != 0:
+                    avoid_side = -self._parking_exit_merge_side
+                else:
+                    avoid_side = -1 if hazard["lateral"] >= 0.0 else 1
+                avoid_steer = avoid_side * self.parking_exit_avoid_steer
+                throttle_value = self._parking_exit_forward_throttle(
+                    throttle,
+                    floor=self.parking_exit_avoid_throttle,
+                    ceiling=self.parking_exit_creep_throttle,
+                )
+                self._last_parking_exit_yield_debug = f"static_avoid:{hazard_debug}"
+                return avoid_steer, throttle_value, False, True
+
+            if in_driving_lane and hazard_static and hazard["distance"] <= self.parking_exit_static_brake_distance:
+                self._last_parking_exit_yield_debug = f"static_close:{hazard_debug}"
                 return steer, 0.0, True, True
-            if "Parking" in lane_type:
+
+            if in_parking_lane and self.step <= self.parking_exit_yield_brake_steps:
+                self._last_parking_exit_yield_debug = f"yield_static_initial:{hazard_debug}"
+                return steer, 0.0, True, True
+
+            if in_parking_lane:
                 merge_steer = self._parking_exit_merge_side * self.parking_exit_merge_steer
-                throttle_value = min(float(np.asarray(throttle).reshape(-1)[0]), self.parking_exit_creep_throttle)
-                self._last_parking_exit_yield_debug = f"gap_creep:{hazard_debug}"
+                throttle_value = self._parking_exit_forward_throttle(throttle)
+                self._last_parking_exit_yield_debug = f"merge_creep:{hazard_debug}"
                 return merge_steer, throttle_value, False, True
 
-        if "Parking" in lane_type:
+        if in_parking_lane:
             merge_steer = self._parking_exit_merge_side * self.parking_exit_merge_steer
-            throttle_value = min(float(np.asarray(throttle).reshape(-1)[0]), self.parking_exit_creep_throttle)
-            self._last_parking_exit_yield_debug = f"creep:{lane_type}"
+            throttle_value = self._parking_exit_forward_throttle(throttle)
+            self._last_parking_exit_yield_debug = f"merge:{lane_type}"
             return merge_steer, throttle_value, False, True
+
+        target_lane_id = getattr(self, "_parking_exit_target_lane_id", None)
+        target_road_id = getattr(self, "_parking_exit_target_road_id", None)
+        try:
+            current_lane_id = int(world_debug.get("lane_id"))
+            current_road_id = int(world_debug.get("road_id"))
+        except Exception:
+            current_lane_id = None
+            current_road_id = None
+        wrong_target_lane = (
+            recenter_window
+            and in_driving_lane
+            and target_lane_id is not None
+            and current_lane_id is not None
+            and current_lane_id != target_lane_id
+            and (target_road_id is None or current_road_id == target_road_id)
+        )
+        if wrong_target_lane and self._parking_exit_merge_side != 0:
+            recover_steer = -self._parking_exit_merge_side * min(0.65, self.parking_exit_merge_steer)
+            throttle_value = self._parking_exit_forward_throttle(
+                throttle,
+                floor=self.parking_exit_avoid_throttle,
+                ceiling=self.parking_exit_creep_throttle,
+            )
+            self._last_parking_exit_yield_debug = (
+                f"lane_recover:{current_road_id}/{current_lane_id}->"
+                f"{target_road_id}/{target_lane_id}"
+            )
+            return recover_steer, throttle_value, False, True
+
+        if (
+            recenter_window
+            and in_driving_lane
+            and world_speed <= self.parking_exit_recenter_speed
+            and lane_dist <= self.parking_exit_recenter_lane_distance
+        ):
+            throttle_value = self._parking_exit_forward_throttle(
+                throttle,
+                floor=self.parking_exit_recenter_throttle,
+            )
+            self._last_parking_exit_yield_debug = f"recenter:{lane_type}"
+            return steer, throttle_value, False, True
 
         self._last_parking_exit_yield_debug = "clear"
         return steer, throttle, brake, False
@@ -1041,10 +1447,11 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
             
             placeholder_values = {'<TARGET_POINT>': target_points_np}
             tmp = {}
-            for key, value in placeholder_values.items():
-                    token_nr_key = self.tokenizer.convert_tokens_to_ids(key)
-                    tmp[token_nr_key] = value
-            placeholder_batch_list.append(tmp)
+            if self.tokenizer is not None:
+                    for key, value in placeholder_values.items():
+                            token_nr_key = self.tokenizer.convert_tokens_to_ids(key)
+                            tmp[token_nr_key] = value
+                    placeholder_batch_list.append(tmp)
             
             prompt_tp = "Target waypoint: <TARGET_POINT><TARGET_POINT>."
             
@@ -1235,8 +1642,14 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         self.DrivingInput["camera_extrinsics"] = torch.repeat_interleave(get_camera_extrinsics().unsqueeze(0), 1, dim=0).view(1, 4, 4).float().to(self.device)
         self.DrivingInput["vehicle_speed"] = result['speed'].to(dtype=self.model_dtype)
         self.DrivingInput["target_point"] = result['target_point'].to(device=self.device, dtype=self.model_dtype)
-        self.DrivingInput["prompt"] = ll
-        self.DrivingInput["prompt_inference"] = ll
+        if getattr(self, "is_base_training_model", False):
+            map_route = result.get('route')
+            if map_route is None:
+                map_route = result['target_point'].unsqueeze(1)
+            self.DrivingInput["map_route"] = map_route.to(device=self.device, dtype=self.model_dtype)
+        else:
+            self.DrivingInput["prompt"] = ll
+            self.DrivingInput["prompt_inference"] = ll
         if getattr(self, 'route_as', 'target_point_command') == 'target_point':
             self.map_route = result['target_point'].to(device=self.device, dtype=self.model_dtype).unsqueeze(1)
         else:
@@ -1259,7 +1672,18 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         tick_data = self.tick(input_data)
 
         # initialize DrivingInput with dict self.DrivingInput
-        model_input = DrivingInput(**self.DrivingInput)
+        if getattr(self, "is_base_training_model", False):
+            model_input = self.driving_input_type(
+                camera_images=self.DrivingInput["camera_images"],
+                image_sizes=self.DrivingInput["image_sizes"],
+                camera_intrinsics=self.DrivingInput["camera_intrinsics"],
+                camera_extrinsics=self.DrivingInput["camera_extrinsics"],
+                vehicle_speed=self.DrivingInput["vehicle_speed"],
+                map_route=self.DrivingInput["map_route"],
+                target_point=self.DrivingInput["target_point"],
+            )
+        else:
+            model_input = self.driving_input_type(**self.DrivingInput)
         pred_speed_wps, pred_route, language = self._unpack_model_output(self.model(model_input))
         pred_speed_wps = pred_speed_wps.float() if pred_speed_wps is not None else None
         pred_route = pred_route.float() if pred_route is not None else None
@@ -1348,6 +1772,13 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         planner_route = tick_data.get("route")
         if self.steer_source == "planner" and planner_route is not None:
             steer_route = planner_route.float()
+        centerline_route = self._build_parking_exit_centerline_route(
+            tick_data.get("gps"),
+            tick_data.get("compass"),
+            steer_route,
+        )
+        if centerline_route is not None:
+            steer_route = centerline_route
 
         steer, throttle, brake = self.control_pid(steer_route, gt_velocity, pred_speed_wps)
         world_debug_guard = self._get_world_debug()
@@ -1418,6 +1849,7 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
                 f"min_desired_speed={self.min_desired_speed:.3f} "
                 f"delta={delta:.3f} stuck={self.stuck_detector} force_move={self.force_move} "
                 f"parking_exit_yield={self._last_parking_exit_yield_debug} "
+                f"parking_exit_centerline={self._last_parking_exit_centerline_debug} "
                 f"steer_source={self.steer_source} "
                 f"world_speed={world_debug['world_speed']:.3f} "
                 f"lane_dist={world_debug['lane_dist']:.3f} "

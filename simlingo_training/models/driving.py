@@ -510,10 +510,10 @@ class DrivingModel(pl.LightningModule):
                     np.asarray(waypoint_ade_to_instruction) <= np.asarray(waypoint_ade_to_original)
                 ))
 
-            save_path_tmp = f"{str(save_prediction_path)}/mtid_samples_{name}_rank_{self.local_rank}.json"
+            save_path_tmp = f"{str(save_prediction_path)}/eval_samples_{name}_rank_{self.local_rank}.json"
             if os.path.exists(save_path_tmp):
                 time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                save_path_tmp = f"{str(save_prediction_path)}/mtid_samples_{name}_rank_{self.local_rank}_{time}.json"
+                save_path_tmp = f"{str(save_prediction_path)}/eval_samples_{name}_rank_{self.local_rank}_{time}.json"
             with open(save_path_tmp, "w") as f:
                 json.dump(sample_rows, f, indent=4)
 

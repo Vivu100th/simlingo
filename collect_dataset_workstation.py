@@ -4,7 +4,8 @@ Workstation dataset collector for SimLingo.
 This is intentionally separate from collect_dataset_local.py so the original
 single-machine script can stay tuned for the current computer.
 
-Common usage on a new machine:
+Common usage on a personal machine (1 GPU, e.g. RTX 5070):
+  conda activate simlingo_personal
   SIMLINGO_CODE_ROOT=/home/<user>/simlingo \
   CARLA_ROOT=/home/<user>/software/carla0915 \
   DATASET_NAME=simlingo_v2_collect_w0 \
@@ -13,13 +14,21 @@ Common usage on a new machine:
 Targeted collection example:
   ROUTE_FILTER='ParkingExit,ParkedObstacle,ParkingCutIn,HazardAtSideLane' \
   DATASET_NAME=simlingo_v2_targeted_w0 \
+  MAX_ROUTES=20 \
+  ROUTE_TIMEOUT_SECONDS=1800 \
   python collect_dataset_workstation.py
 
-4-worker example:
-  ROUTE_SHARD_COUNT=4 ROUTE_SHARD_INDEX=0 CARLA_WORLD_PORT=2000 CARLA_TM_PORT=8000 DATASET_NAME=simlingo_v2_collect_w0 python collect_dataset_workstation.py
-  ROUTE_SHARD_COUNT=4 ROUTE_SHARD_INDEX=1 CARLA_WORLD_PORT=2010 CARLA_TM_PORT=8010 DATASET_NAME=simlingo_v2_collect_w1 python collect_dataset_workstation.py
-  ROUTE_SHARD_COUNT=4 ROUTE_SHARD_INDEX=2 CARLA_WORLD_PORT=2020 CARLA_TM_PORT=8020 DATASET_NAME=simlingo_v2_collect_w2 python collect_dataset_workstation.py
-  ROUTE_SHARD_COUNT=4 ROUTE_SHARD_INDEX=3 CARLA_WORLD_PORT=2030 CARLA_TM_PORT=8030 DATASET_NAME=simlingo_v2_collect_w3 python collect_dataset_workstation.py
+Single route/scenario example:
+  ROUTE_FILE=leaderboard/data/bench2drive_split/bench2drive_07.xml \
+  SCENARIO_GROUP=parking_exit \
+  DATASET_NAME=simlingo_v2_one_parking_exit \
+  MAX_RETRIES=1 \
+  AUTO_START_CARLA=1 \
+  python collect_dataset_workstation.py
+
+2-worker example for a dual-GPU box (e.g. 2x RTX 3080):
+  CUDA_VISIBLE_DEVICES=0 ROUTE_SHARD_COUNT=2 ROUTE_SHARD_INDEX=0 CARLA_WORLD_PORT=2000 CARLA_TM_PORT=8000 DATASET_NAME=simlingo_v2_collect_w0 python collect_dataset_workstation.py
+  CUDA_VISIBLE_DEVICES=1 ROUTE_SHARD_COUNT=2 ROUTE_SHARD_INDEX=1 CARLA_WORLD_PORT=2010 CARLA_TM_PORT=8010 DATASET_NAME=simlingo_v2_collect_w1 python collect_dataset_workstation.py
 """
 
 from datetime import datetime
@@ -105,9 +114,12 @@ CARLA_STARTUP_WAIT = _env_int("CARLA_STARTUP_WAIT", 40)
 # Workstation collection controls
 ROUTE_SHARD_INDEX = _env_int("ROUTE_SHARD_INDEX", 0)
 ROUTE_SHARD_COUNT = _env_int("ROUTE_SHARD_COUNT", 1)
+ROUTE_FILE = os.environ.get("ROUTE_FILE", "").strip()
+SCENARIO_GROUP = os.environ.get("SCENARIO_GROUP", "").strip()
 ROUTE_FILTER = os.environ.get("ROUTE_FILTER", "").strip()
 ROUTE_RANDOM_SEED = _env_int("ROUTE_RANDOM_SEED", 42)
 MAX_ROUTES = _env_int("MAX_ROUTES", 0)
+ROUTE_TIMEOUT_SECONDS = _env_int("ROUTE_TIMEOUT_SECONDS", 3600)
 PYTHON_BIN = os.environ.get("PYTHON_BIN", sys.executable)
 
 # ============================================================================
@@ -421,6 +433,27 @@ def route_matches_filter(route_file):
     return any(term in haystack for term in terms)
 
 
+def route_town(route_file):
+    """Infer the CARLA town from a route path or from the XML route attribute."""
+    match = re.search(r'Town(\d+)', route_file)
+    if match:
+        return match.group(0)
+
+    try:
+        text = Path(route_file).read_text(encoding="utf-8", errors="ignore")
+        match = re.search(r'town=["\'](Town\d+)["\']', text)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+
+    if 'validation' in route_file:
+        return 'Town13'
+    if 'training' in route_file:
+        return 'Town12'
+    return None
+
+
 def is_route_completed(result_file):
     """Check if a route has already been completed successfully."""
     if not os.path.exists(result_file):
@@ -487,11 +520,11 @@ def run_single_route(route_file, agent, checkpoint_endpoint, save_path, seed, to
             run_command,
             cwd=CODE_ROOT,
             env=env,
-            timeout=3600,  # 1 hour timeout per route
+            timeout=ROUTE_TIMEOUT_SECONDS,
         )
         return result.returncode == 0
     except subprocess.TimeoutExpired:
-        print("  TIMEOUT: Route took longer than 1 hour, skipping.")
+        print(f"  TIMEOUT: Route took longer than {ROUTE_TIMEOUT_SECONDS}s, skipping.")
         return False
     except Exception as e:
         print(f"  ERROR: {e}")
@@ -510,12 +543,19 @@ def main():
 
     route_folder = f"{CODE_ROOT}/data/simlingo"
 
-    # Find all route files
-    routes = glob.glob(f"{route_folder}/**/*balanced*/*.xml", recursive=True)
-    routes_lb1 = glob.glob(f"{route_folder}/**/*lb1*/**/*.xml", recursive=True)
-    routes = sorted(set(routes + routes_lb1))
+    if ROUTE_FILE:
+        route_path = Path(ROUTE_FILE)
+        if not route_path.is_absolute():
+            route_path = Path(CODE_ROOT) / route_path
+        routes = [str(route_path)]
+        print(f"Using explicit route file: {routes[0]}")
+    else:
+        # Find all route files
+        routes = glob.glob(f"{route_folder}/**/*balanced*/*.xml", recursive=True)
+        routes_lb1 = glob.glob(f"{route_folder}/**/*lb1*/**/*.xml", recursive=True)
+        routes = sorted(set(routes + routes_lb1))
 
-    if ROUTE_FILTER:
+    if ROUTE_FILTER and not ROUTE_FILE:
         routes_before_filter = len(routes)
         routes = [route for route in routes if route_matches_filter(route)]
         print(f"Route filter: '{ROUTE_FILTER}' matched {len(routes)}/{routes_before_filter} routes")
@@ -564,9 +604,11 @@ def main():
         print(f"Graphics:      {CARLA_GRAPHICS_ADAPTER}")
     print(f"Dataset:       {DATASET_NAME}")
     print(f"Save to:       {CODE_ROOT}/{DATA_SAVE_DIRECTORY}")
+    print(f"Route file:    {ROUTE_FILE or '<auto>'}")
     print(f"Route filter:  {ROUTE_FILTER or '<none>'}")
     print(f"Shard:         {ROUTE_SHARD_INDEX}/{ROUTE_SHARD_COUNT} ({routes_before_shard} before shard)")
     print(f"Max routes:    {MAX_ROUTES if MAX_ROUTES > 0 else '<all>'}")
+    print(f"Route timeout: {ROUTE_TIMEOUT_SECONDS}s")
     print(f"Total routes:  {num_routes}")
     print(f"Repetitions:   {REPETITIONS}")
     print(f"{'='*60}\n")
@@ -584,23 +626,27 @@ def main():
                 job_number += 1
 
                 # Extract town name
-                try:
-                    town = re.search(r'Town(\d+)', route).group(0)
-                except AttributeError:
-                    if 'validation' in route:
-                        town = 'Town13'
-                    elif 'training' in route:
-                        town = 'Town12'
-                    else:
-                        print(f"  Town not found in route {route}, skipping.")
-                        skipped += 1
-                        continue
+                town = route_town(route)
+                if town is None:
+                    print(f"  Town not found in route {route}, skipping.")
+                    skipped += 1
+                    continue
 
-                # Build paths
-                scenario_type = route.split("/")[-5:-1]
-                scenario_type = "/".join(scenario_type)
-                routefile_number = route.split("/")[-1].split(".")[0]
-                ckpt_endpoint = f"{CODE_ROOT}/{DATA_SAVE_DIRECTORY}/results/{scenario_type}/{routefile_number}_result.json"
+                # Build paths. For explicit custom routes outside data/simlingo,
+                # group them under SCENARIO_GROUP so the collected dataset stays tidy.
+                route_path = Path(route)
+                routefile_number = route_path.stem
+                if SCENARIO_GROUP:
+                    scenario_type = f"simlingo/one_scenario/{SCENARIO_GROUP}/{routefile_number}"
+                else:
+                    try:
+                        scenario_type = str(Path("simlingo") / route_path.parent.relative_to(route_folder))
+                    except ValueError:
+                        scenario_type = f"simlingo/one_scenario/{route_path.stem}/{routefile_number}"
+                ckpt_endpoint = (
+                    f"{CODE_ROOT}/{DATA_SAVE_DIRECTORY}/results/{scenario_type}/"
+                    f"{routefile_number}_rep{repetition}_result.json"
+                )
                 save_path = f"{CODE_ROOT}/{DATA_SAVE_DIRECTORY}/data/{scenario_type}"
                 Path(save_path).mkdir(parents=True, exist_ok=True)
                 Path(ckpt_endpoint).parent.mkdir(parents=True, exist_ok=True)

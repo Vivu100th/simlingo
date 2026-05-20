@@ -16,13 +16,11 @@ eval/
 eval_results/
 eval_outputs/
 logs/
-
-# MTID generated data. Keep source/docs/tests in mtid/, but not generated labels.
-!mtid/outputs/
-mtid/outputs/*
-!mtid/outputs/.gitignore
-mtid/experiments/*
-!mtid/experiments/.gitignore
+errors/
+.codex
+proposal_visualization/
+slide.html
+papers/*.pdf
 
 # Training/evaluation run internals
 wandb/
@@ -42,6 +40,16 @@ pytorch_model*.bin
 mp_rank_*_model_states.pt
 zero_pp_rank_*.pt
 global_step*/
+
+# Local transfer archives / media captures
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.mp4
+*.avi
+*.mkv
 
 # Local process/log sidecars
 *.pid

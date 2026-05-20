@@ -1,20 +1,19 @@
 """
-Runs the closed-loop evaluation (benchmark) for the MTID model in CARLA locally.
+Runs a local closed-loop Bench2Drive evaluation for a SimLingo Base checkpoint.
 
 Usage:
   python run_benchmark_local.py
 
 Optional environment overrides:
-  SIMLINGO_BENCHMARK_ROUTES=mtid/routes/routes_mtid_smoke.xml
-  SIMLINGO_BENCHMARK_CHECKPOINT=outputs/.../checkpoints/last.ckpt
-  SIMLINGO_BENCHMARK_RESULT=outputs/benchmark_mtid_results.json
+  SIMLINGO_BENCHMARK_ROUTES=leaderboard/data/bench2drive_split/bench2drive_07.xml
+  SIMLINGO_BENCHMARK_CHECKPOINT=outputs/.../checkpoints/epoch=029_fp32/pytorch_model.bin
+  SIMLINGO_BENCHMARK_RESULT=outputs/benchmark_base_results.json
   SIMLINGO_BENCHMARK_RESUME=0
 
 This script will:
-1. Start the CARLA server in the background.
-2. Run the leaderboard evaluator using the MTID 10-epoch checkpoint.
-3. Save the results to `outputs/benchmark_mtid_results.json`.
-4. Clean up the CARLA server when done.
+1. Configure the CARLA/Bench2Drive environment.
+2. Run the leaderboard evaluator using the selected SimLingo Base checkpoint.
+3. Save the results to `outputs/benchmark_base_results.json`.
 """
 
 import os
@@ -31,23 +30,23 @@ import atexit
 CODE_ROOT = r"/home/vivu/Desktop/simlingo"
 CARLA_ROOT = "/home/vivu/software/carla0915"
 
-# The route file to evaluate on. The default is a short MTID smoke route so a
-# local CARLA integration check can finish quickly on an 11-12GB GPU.
+# The route file to evaluate on. The default is a single Bench2Drive ParkingExit
+# route so a local CARLA integration check can finish on one GPU.
 # Override examples:
 #   SIMLINGO_BENCHMARK_ROUTES=leaderboard/data/routes_devtest.xml python run_benchmark_local.py
 #   SIMLINGO_BENCHMARK_ROUTES=leaderboard/data/bench2drive220.xml python run_benchmark_local.py
 ROUTES_FILE = os.environ.get(
     "SIMLINGO_BENCHMARK_ROUTES",
-    f"{CODE_ROOT}/mtid/routes/routes_mtid_smoke.xml",
+    f"{CODE_ROOT}/leaderboard/data/bench2drive_split/bench2drive_07.xml",
 )
 if not os.path.isabs(ROUTES_FILE):
     ROUTES_FILE = os.path.join(CODE_ROOT, ROUTES_FILE)
 
-# The trained MTID 10e checkpoint. Override with SIMLINGO_BENCHMARK_CHECKPOINT
-# when comparing against a control checkpoint.
+# Default SimLingo Base checkpoint. Override with SIMLINGO_BENCHMARK_CHECKPOINT
+# when evaluating a newly trained checkpoint.
 CHECKPOINT_MODEL = os.environ.get(
     "SIMLINGO_BENCHMARK_CHECKPOINT",
-    f"{CODE_ROOT}/outputs/2026_04_28_00_46_43_simlingo_mtid_10e/checkpoints/last.ckpt",
+    f"{CODE_ROOT}/outputs/2026_05_07_18_28_45_simlingo_base_seed_42/checkpoints/epoch=029_fp32/pytorch_model.bin",
 )
 if not os.path.isabs(CHECKPOINT_MODEL):
     CHECKPOINT_MODEL = os.path.join(CODE_ROOT, CHECKPOINT_MODEL)
@@ -56,7 +55,7 @@ if not os.path.isabs(CHECKPOINT_MODEL):
 # checkpoint comparisons so stale partial JSON files do not collide.
 RESULTS_JSON = os.environ.get(
     "SIMLINGO_BENCHMARK_RESULT",
-    f"{CODE_ROOT}/outputs/benchmark_mtid_results.json",
+    f"{CODE_ROOT}/outputs/benchmark_base_results.json",
 )
 if not os.path.isabs(RESULTS_JSON):
     RESULTS_JSON = os.path.join(CODE_ROOT, RESULTS_JSON)
@@ -65,6 +64,7 @@ CARLA_WORLD_PORT = 2000
 CARLA_TM_PORT = 8000
 CARLA_STARTUP_WAIT = 40
 RESUME_BENCHMARK = bool(int(os.environ.get("SIMLINGO_BENCHMARK_RESUME", "0")))
+BENCHMARK_DEBUG = int(os.environ.get("SIMLINGO_BENCHMARK_DEBUG", "0"))
 
 _carla_process = None
 
@@ -76,6 +76,10 @@ def setup_environment():
     os.environ["CARLA_ROOT"] = CARLA_ROOT
     os.environ["CARLA_SERVER"] = f"{CARLA_ROOT}/CarlaUE4.sh"
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    if "CUDA_HOME" not in os.environ:
+        python_prefix = os.path.dirname(os.path.dirname(sys.executable))
+        if os.path.exists(os.path.join(python_prefix, "bin", "nvcc")):
+            os.environ["CUDA_HOME"] = python_prefix
 
     pythonpath_additions = [
         f"{CARLA_ROOT}/PythonAPI/carla",
@@ -154,7 +158,7 @@ def run_benchmark():
         f"--checkpoint={RESULTS_JSON}",
         f"--agent={agent}",
         f"--agent-config={CHECKPOINT_MODEL}",
-        "--debug=0",
+        f"--debug={BENCHMARK_DEBUG}",
     ]
     if RESUME_BENCHMARK:
         run_command.append("--resume=1")

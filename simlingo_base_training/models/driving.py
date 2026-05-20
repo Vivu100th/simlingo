@@ -4,7 +4,6 @@ from typing import Optional, Tuple
 
 import pytorch_lightning as pl
 import torch
-from deepspeed.ops.adam import FusedAdam
 from torch import Tensor, nn
 from torchvision.models import ResNet18_Weights, resnet18
 
@@ -278,9 +277,12 @@ class DrivingModel(pl.LightningModule):
             ParamGroup(r"^(model|language_model|language_projection|adaptors|speed_encoder|route_encoder)\..*", self.lr, self.weight_decay),
             ParamGroup(r"^vision_model\..*", self.vision_lr, self.weight_decay),
         ]
-        optimizer_class = (
-            FusedAdam if isinstance(self.trainer.strategy, pl.strategies.DeepSpeedStrategy) else torch.optim.AdamW
-        )
+        if isinstance(self.trainer.strategy, pl.strategies.DeepSpeedStrategy):
+            from deepspeed.ops.adam import FusedAdam
+
+            optimizer_class = FusedAdam
+        else:
+            optimizer_class = torch.optim.AdamW
         optimizer = optimizer_class(configure_params_groups(self, param_groups, verbose=False), betas=self.betas)
         lrs = [pg['lr'] for pg in optimizer.param_groups]
         if self.trainer.max_steps == -1:
